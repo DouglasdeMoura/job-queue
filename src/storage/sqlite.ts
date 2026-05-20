@@ -438,6 +438,19 @@ export class SQLiteStorage implements Storage {
     return /SQLITE_BUSY|SQLITE_LOCKED|database is locked/i.test(err.message ?? '')
   }
 
+  // SQLite auto-rolls back on hard errors (SQLITE_FULL, SQLITE_IOERR,
+  // SQLITE_NOMEM, SQLITE_INTERRUPT, some SQLITE_BUSY-on-COMMIT cases), so a
+  // follow-up ROLLBACK then errors with "no transaction is active." That's
+  // benign; log at debug so unexpected failures (closed handle, driver bug)
+  // are still greppable.
+  #safeRollback (): void {
+    try {
+      this.#db?.exec('ROLLBACK')
+    } catch (err) {
+      this.#logger.debug({ err }, 'SQLiteStorage: ROLLBACK after failed tx errored (likely auto-rolled back)')
+    }
+  }
+
   #clearDequeueWaiters (): void {
     for (const waiter of this.#dequeueWaiters) {
       clearTimeout(waiter.timeoutId)
@@ -497,11 +510,7 @@ export class SQLiteStorage implements Storage {
         db.exec('COMMIT')
         return null
       } catch (err) {
-        try {
-          db.exec('ROLLBACK')
-        } catch {
-          // ignore
-        }
+        this.#safeRollback()
         throw err
       }
     })
@@ -553,11 +562,7 @@ export class SQLiteStorage implements Storage {
         db.exec('COMMIT')
         return message
       } catch (err) {
-        try {
-          db.exec('ROLLBACK')
-        } catch {
-          // ignore
-        }
+        this.#safeRollback()
         throw err
       }
     })
@@ -572,11 +577,7 @@ export class SQLiteStorage implements Storage {
         db.prepare(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
         db.exec('COMMIT')
       } catch (err) {
-        try {
-          db.exec('ROLLBACK')
-        } catch {
-          // ignore
-        }
+        this.#safeRollback()
         throw err
       }
     })
@@ -838,11 +839,7 @@ export class SQLiteStorage implements Storage {
         db.prepare(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
         db.exec('COMMIT')
       } catch (err) {
-        try {
-          db.exec('ROLLBACK')
-        } catch {
-          // ignore
-        }
+        this.#safeRollback()
         throw err
       }
     })
@@ -869,11 +866,7 @@ export class SQLiteStorage implements Storage {
         db.prepare(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
         db.exec('COMMIT')
       } catch (err) {
-        try {
-          db.exec('ROLLBACK')
-        } catch {
-          // ignore
-        }
+        this.#safeRollback()
         throw err
       }
     })
@@ -899,11 +892,7 @@ export class SQLiteStorage implements Storage {
         db.prepare(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
         db.exec('COMMIT')
       } catch (err) {
-        try {
-          db.exec('ROLLBACK')
-        } catch {
-          // ignore
-        }
+        this.#safeRollback()
         throw err
       }
     })
@@ -943,11 +932,7 @@ export class SQLiteStorage implements Storage {
         db.exec('COMMIT')
         return true
       } catch (err) {
-        try {
-          db.exec('ROLLBACK')
-        } catch {
-          // ignore
-        }
+        this.#safeRollback()
         throw err
       }
     })
