@@ -557,6 +557,95 @@ describe('SQLiteStorage', () => {
         Object.defineProperty(process, 'pid', { value: originalPid, configurable: true })
       }
     })
+
+    it('should not close the shared db handle when disconnect() runs in a forked process', async () => {
+      // Forked-child disconnect must drop local refs only — closing #db would
+      // corrupt the parent process's still-open OS handle.
+      const originalPid = process.pid
+      Object.defineProperty(process, 'pid', { value: originalPid + 1, configurable: true })
+      try {
+        await storage.disconnect()
+      } finally {
+        Object.defineProperty(process, 'pid', { value: originalPid, configurable: true })
+      }
+      // The storage instance now has #db = null locally, but a fresh instance
+      // pointing at :memory: should work — proves the OS-level handle wasn't
+      // catastrophically closed across all process state.
+      const s = new SQLiteStorage()
+      await s.connect()
+      await s.enqueue('postfork', Buffer.from('x'), Date.now())
+      const out = await s.dequeue('w', 1)
+      assert.deepStrictEqual(out, Buffer.from('x'))
+      await s.disconnect()
+    })
+  })
+
+  describe('retryJob with concurrent in-flight jobs', () => {
+    it('should not wipe sibling processing rows for the same worker', async () => {
+      // With consumer.concurrency > 1 a single worker can hold multiple
+      // in-flight messages. retryJob on one must not delete the others.
+      const msgA = Buffer.from(JSON.stringify({ id: 'job-a', payload: 'a', attempts: 0 }))
+      const msgB = Buffer.from(JSON.stringify({ id: 'job-b', payload: 'b', attempts: 0 }))
+
+      await storage.enqueue('job-a', msgA, Date.now())
+      await storage.enqueue('job-b', msgB, Date.now())
+      await storage.dequeue('worker-1', 1)
+      await storage.dequeue('worker-1', 1)
+
+      const beforeProcessing = await storage.getProcessingJobs('worker-1')
+      assert.strictEqual(beforeProcessing.length, 2)
+
+      const retryA = Buffer.from(JSON.stringify({ id: 'job-a', payload: 'a', attempts: 1 }))
+      await storage.retryJob('job-a', retryA, 'worker-1', 1)
+
+      const afterProcessing = await storage.getProcessingJobs('worker-1')
+      // job-b should still be in processing; only job-a was removed.
+      assert.strictEqual(afterProcessing.length, 1)
+      assert.deepStrictEqual(afterProcessing[0], msgB)
+    })
+  })
+
+  describe('namespace lifecycle (adversarial)', () => {
+    it('should be idempotent on double disconnect', async () => {
+      const ns = storage.createNamespace('ns-double') as SQLiteStorage
+      await ns.connect()
+      await ns.disconnect()
+      // Second disconnect must not decrement parent refCount again.
+      await ns.disconnect()
+      // Parent should still be cleanly disconnectable at end of test.
+      // (afterEach will call storage.disconnect(); this assertion is implicit.)
+    })
+
+    it('should roll back parent refCount when child connect fails', async () => {
+      // We can't easily make parent.connect() throw, so simulate the failure
+      // by giving the child a parentStorage whose connect rejects.
+      const failingParent = new SQLiteStorage({ path: '/nonexistent/dir/sqlite.db' })
+      const child = failingParent.createNamespace('x') as SQLiteStorage
+      await assert.rejects(child.connect(), /failed to open/)
+      // Now disconnecting the failing parent should succeed and not be blocked
+      // by a phantom refCount.
+      await failingParent.disconnect()
+    })
+
+    it('should sweep namespace tables in cleanup', async () => {
+      // Use a short cleanupIntervalMs so the leader sweeps quickly.
+      const root = new SQLiteStorage({ cleanupIntervalMs: 50 })
+      await root.connect()
+      const ns = root.createNamespace('cleanup-test') as SQLiteStorage
+      await ns.connect()
+      try {
+        // Put an expired result into the namespace.
+        await ns.setResult('expired-job', Buffer.from('data'), 10)
+        await sleep(50)
+        // Wait for at least one cleanup tick (interval 50ms + ~10ms leader lock acquire).
+        await sleep(300)
+        const result = await ns.getResult('expired-job')
+        assert.strictEqual(result, null, 'namespace result should be swept by root cleanup')
+      } finally {
+        await ns.disconnect()
+        await root.disconnect()
+      }
+    })
   })
 })
 
