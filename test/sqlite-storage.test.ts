@@ -543,6 +543,21 @@ describe('SQLiteStorage', () => {
       }
     })
   })
+
+  describe('fork-after-connect pid assertion', () => {
+    it('should reject unregisterWorker / clear / releaseLeaderLock from a different pid', async () => {
+      // Simulate fork by overriding process.pid. Restore in finally.
+      const originalPid = process.pid
+      Object.defineProperty(process, 'pid', { value: originalPid + 1, configurable: true })
+      try {
+        await assert.rejects(storage.unregisterWorker('w1'), /forked process/)
+        await assert.rejects(storage.clear(), /forked process/)
+        await assert.rejects(storage.releaseLeaderLock('k', 'o'), /forked process/)
+      } finally {
+        Object.defineProperty(process, 'pid', { value: originalPid, configurable: true })
+      }
+    })
+  })
 })
 
 describe('SQLiteStorage (file-backed)', () => {

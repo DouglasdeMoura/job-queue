@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
-import { DatabaseSync } from 'node:sqlite'
+import { DatabaseSync, type StatementSync } from 'node:sqlite'
 import type { Logger } from 'pino'
 import type { Storage } from './types.ts'
 import { abstractLogger } from '../utils/logging.ts'
@@ -131,6 +131,10 @@ export class SQLiteStorage implements Storage {
 
   #db: DatabaseSync | null = null
   #connectedPid: number | null = null
+  // Cache of prepared statements keyed by SQL. node:sqlite's prepare() re-parses
+  // every call; reusing StatementSync instances avoids that cost on hot paths.
+  // Cleared on disconnect (statements become invalid once the db handle closes).
+  #stmts: Map<string, StatementSync> = new Map()
 
   #eventEmitter = new EventEmitter({ captureRejections: true })
   #notifyEmitter = new EventEmitter({ captureRejections: true })
@@ -223,6 +227,7 @@ export class SQLiteStorage implements Storage {
       this.#clearDequeueWaiters()
       this.#eventEmitter.removeAllListeners()
       this.#notifyEmitter.removeAllListeners()
+      this.#stmts.clear()
       this.#db = null
       this.#connectedPid = null
       this.#parentStorage.#refCount--
@@ -256,6 +261,7 @@ export class SQLiteStorage implements Storage {
     this.#clearDequeueWaiters()
     this.#eventEmitter.removeAllListeners()
     this.#notifyEmitter.removeAllListeners()
+    this.#stmts.clear()
 
     if (this.#db) {
       try {
@@ -268,6 +274,9 @@ export class SQLiteStorage implements Storage {
     this.#connectedPid = null
   }
 
+  // SQLite does not accept bind parameters inside PRAGMA statements, so values
+  // are interpolated. Pragma keys/values come from the SQLiteStorageConfig
+  // object — trusted at the same level as tablePrefix and path.
   #applyPragmas (): void {
     const db = this.#db!
     for (const [key, value] of Object.entries(this.#pragmas)) {
@@ -280,7 +289,7 @@ export class SQLiteStorage implements Storage {
     if (this.#path === ':memory:') return // WAL not applicable for :memory:
     const requestedJournalMode = String(this.#pragmas.journal_mode ?? '').toLowerCase()
     if (requestedJournalMode !== 'wal') return
-    const row = this.#db!.prepare('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined
+    const row = this.#stmt('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined
     const actual = row?.journal_mode?.toLowerCase()
     if (actual !== 'wal') {
       this.#logger.warn(
@@ -342,13 +351,12 @@ export class SQLiteStorage implements Storage {
   }
 
   #checkSchemaVersion (): void {
-    const db = this.#db!
-    const row = db.prepare(`SELECT value FROM "${this.#metaTable}" WHERE key = 'schema_version'`).get() as
+    const row = this.#stmt(`SELECT value FROM "${this.#metaTable}" WHERE key = 'schema_version'`).get() as
       | { value?: string }
       | undefined
 
     if (!row) {
-      db.prepare(`INSERT OR IGNORE INTO "${this.#metaTable}" (key, value) VALUES ('schema_version', ?)`).run(
+      this.#stmt(`INSERT OR IGNORE INTO "${this.#metaTable}" (key, value) VALUES ('schema_version', ?)`).run(
         String(SCHEMA_VERSION)
       )
       return
@@ -356,8 +364,9 @@ export class SQLiteStorage implements Storage {
 
     const found = parseInt(row.value ?? '0', 10)
     if (Number.isNaN(found) || found > SCHEMA_VERSION) {
+      const echoed = JSON.stringify(row.value ?? null).slice(0, 32)
       throw new StorageError(
-        `SQLiteStorage: database schema version ${row.value ?? '(invalid)'} is not supported ` +
+        `SQLiteStorage: database schema version ${echoed} is not supported ` +
           `by this library (supports schema v${SCHEMA_VERSION}). Downgrade is not supported.`
       )
     }
@@ -371,6 +380,11 @@ export class SQLiteStorage implements Storage {
     if (!this.#db) {
       throw new StorageError('SQLiteStorage: not connected. Call connect() first.')
     }
+    this.#assertSamePid()
+    return this.#db
+  }
+
+  #assertSamePid (): void {
     if (this.#connectedPid !== null && process.pid !== this.#connectedPid) {
       throw new StorageError(
         'SQLiteStorage: detected use from a forked process ' +
@@ -379,7 +393,15 @@ export class SQLiteStorage implements Storage {
           'For multi-process queues, use PgStorage.'
       )
     }
-    return this.#db
+  }
+
+  #stmt (sql: string): StatementSync {
+    let stmt = this.#stmts.get(sql)
+    if (!stmt) {
+      stmt = this.#db!.prepare(sql)
+      this.#stmts.set(sql, stmt)
+    }
+    return stmt
   }
 
   /**
@@ -410,9 +432,8 @@ export class SQLiteStorage implements Storage {
       }
       throw new StorageError(
         `SQLiteStorage: database is locked after ${WRITE_RETRY_ATTEMPTS} retries ` +
-          '(~' +
-          WRITE_RETRY_ATTEMPTS * WRITE_RETRY_MAX_MS +
-          'ms). Another writer is holding the lock. ' +
+          `(exponential backoff up to ${WRITE_RETRY_MAX_MS}ms per attempt). ` +
+          'Another writer is holding the lock. ' +
           'Either reduce contention, increase busy_timeout via pragmas, or switch to PgStorage.',
         lastError instanceof Error ? lastError : undefined
       )
@@ -431,11 +452,11 @@ export class SQLiteStorage implements Storage {
     return previous.then(() => resolver)
   }
 
+  // node:sqlite errors expose .errcode as SQLite's extended result code; mask
+  // to the low byte to compare against the primary code (BUSY=5, LOCKED=6).
   #isBusyError (err: unknown): boolean {
-    if (!(err instanceof Error)) return false
-    const code = (err as NodeJS.ErrnoException).code
-    if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED') return true
-    return /SQLITE_BUSY|SQLITE_LOCKED|database is locked/i.test(err.message ?? '')
+    const primary = ((err as { errcode?: number } | null)?.errcode ?? 0) & 0xff
+    return primary === 5 || primary === 6
   }
 
   // SQLite auto-rolls back on hard errors (SQLITE_FULL, SQLITE_IOERR,
@@ -491,22 +512,22 @@ export class SQLiteStorage implements Storage {
     const existing = await this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
-        const row = db.prepare(`SELECT state, expires_at FROM "${this.#jobsTable}" WHERE id = ?`).get(id) as
+        const row = this.#stmt(`SELECT state, expires_at FROM "${this.#jobsTable}" WHERE id = ?`).get(id) as
           | { state?: string; expires_at?: number | null }
           | undefined
 
         if (row) {
           const expiresAt = row.expires_at ?? null
           if (expiresAt && now >= expiresAt) {
-            db.prepare(`DELETE FROM "${this.#jobsTable}" WHERE id = ?`).run(id)
+            this.#stmt(`DELETE FROM "${this.#jobsTable}" WHERE id = ?`).run(id)
           } else {
             db.exec('COMMIT')
             return row.state ?? null
           }
         }
 
-        db.prepare(`INSERT INTO "${this.#jobsTable}" (id, state) VALUES (?, ?)`).run(id, state)
-        db.prepare(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
+        this.#stmt(`INSERT INTO "${this.#jobsTable}" (id, state) VALUES (?, ?)`).run(id, state)
+        this.#stmt(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
         db.exec('COMMIT')
         return null
       } catch (err) {
@@ -544,13 +565,11 @@ export class SQLiteStorage implements Storage {
     return this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
-        const row = db
-          .prepare(
-            `DELETE FROM "${this.#queueTable}"
+        const row = this.#stmt(
+          `DELETE FROM "${this.#queueTable}"
              WHERE seq = (SELECT seq FROM "${this.#queueTable}" ORDER BY seq LIMIT 1)
              RETURNING message`
-          )
-          .get() as { message?: unknown } | undefined
+        ).get() as { message?: unknown } | undefined
 
         if (!row || row.message === undefined) {
           db.exec('COMMIT')
@@ -558,7 +577,7 @@ export class SQLiteStorage implements Storage {
         }
 
         const message = toBuffer(row.message)
-        db.prepare(`INSERT INTO "${this.#processingTable}" (worker_id, message) VALUES (?, ?)`).run(workerId, message)
+        this.#stmt(`INSERT INTO "${this.#processingTable}" (worker_id, message) VALUES (?, ?)`).run(workerId, message)
         db.exec('COMMIT')
         return message
       } catch (err) {
@@ -573,8 +592,8 @@ export class SQLiteStorage implements Storage {
     await this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
-        db.prepare(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
-        db.prepare(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
+        this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
+        this.#stmt(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
         db.exec('COMMIT')
       } catch (err) {
         this.#safeRollback()
@@ -585,9 +604,9 @@ export class SQLiteStorage implements Storage {
   }
 
   async ack (id: string, message: Buffer, workerId: string): Promise<void> {
-    const db = this.#assertConnected()
+    this.#assertConnected()
     await this.#runWrite(() => {
-      db.prepare(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
+      this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
     })
   }
 
@@ -596,8 +615,8 @@ export class SQLiteStorage implements Storage {
   // ═══════════════════════════════════════════════════════════════════
 
   async getJobState (id: string): Promise<string | null> {
-    const db = this.#assertConnected()
-    const row = db.prepare(`SELECT state, expires_at FROM "${this.#jobsTable}" WHERE id = ?`).get(id) as
+    this.#assertConnected()
+    const row = this.#stmt(`SELECT state, expires_at FROM "${this.#jobsTable}" WHERE id = ?`).get(id) as
       | { state?: string; expires_at?: number | null }
       | undefined
 
@@ -605,7 +624,7 @@ export class SQLiteStorage implements Storage {
     const expiresAt = row.expires_at ?? null
     if (expiresAt && Date.now() >= expiresAt) {
       await this.#runWrite(() => {
-        db.prepare(`DELETE FROM "${this.#jobsTable}" WHERE id = ?`).run(id)
+        this.#stmt(`DELETE FROM "${this.#jobsTable}" WHERE id = ?`).run(id)
       })
       return null
     }
@@ -613,16 +632,16 @@ export class SQLiteStorage implements Storage {
   }
 
   async setJobState (id: string, state: string): Promise<void> {
-    const db = this.#assertConnected()
+    this.#assertConnected()
     await this.#runWrite(() => {
-      db.prepare(`UPDATE "${this.#jobsTable}" SET state = ? WHERE id = ?`).run(state, id)
+      this.#stmt(`UPDATE "${this.#jobsTable}" SET state = ? WHERE id = ?`).run(state, id)
     })
   }
 
   async deleteJob (id: string): Promise<boolean> {
-    const db = this.#assertConnected()
+    this.#assertConnected()
     const changes = await this.#runWrite(() => {
-      const result = db.prepare(`DELETE FROM "${this.#jobsTable}" WHERE id = ?`).run(id)
+      const result = this.#stmt(`DELETE FROM "${this.#jobsTable}" WHERE id = ?`).run(id)
       return result.changes
     })
     if (changes > 0) {
@@ -636,11 +655,11 @@ export class SQLiteStorage implements Storage {
     const result = new Map<string, string | null>()
     if (ids.length === 0) return result
 
-    const db = this.#assertConnected()
+    this.#assertConnected()
     const placeholders = ids.map(() => '?').join(',')
-    const rows = db
-      .prepare(`SELECT id, state, expires_at FROM "${this.#jobsTable}" WHERE id IN (${placeholders})`)
-      .all(...ids) as Array<{ id: string; state: string; expires_at: number | null }>
+    const rows = this.#stmt(`SELECT id, state, expires_at FROM "${this.#jobsTable}" WHERE id IN (${placeholders})`).all(
+      ...ids
+    ) as Array<{ id: string; state: string; expires_at: number | null }>
 
     const now = Date.now()
     const found = new Set<string>()
@@ -659,7 +678,7 @@ export class SQLiteStorage implements Storage {
     if (expiredIds.length > 0) {
       const expiredPlaceholders = expiredIds.map(() => '?').join(',')
       await this.#runWrite(() => {
-        db.prepare(`DELETE FROM "${this.#jobsTable}" WHERE id IN (${expiredPlaceholders})`).run(...expiredIds)
+        this.#stmt(`DELETE FROM "${this.#jobsTable}" WHERE id IN (${expiredPlaceholders})`).run(...expiredIds)
       })
     }
 
@@ -671,10 +690,10 @@ export class SQLiteStorage implements Storage {
   }
 
   async setJobExpiry (id: string, ttlMs: number): Promise<void> {
-    const db = this.#assertConnected()
+    this.#assertConnected()
     const expiresAt = Date.now() + ttlMs
     await this.#runWrite(() => {
-      db.prepare(`UPDATE "${this.#jobsTable}" SET expires_at = ? WHERE id = ?`).run(expiresAt, id)
+      this.#stmt(`UPDATE "${this.#jobsTable}" SET expires_at = ? WHERE id = ?`).run(expiresAt, id)
     })
   }
 
@@ -683,10 +702,10 @@ export class SQLiteStorage implements Storage {
   // ═══════════════════════════════════════════════════════════════════
 
   async setResult (id: string, result: Buffer, ttlMs: number): Promise<void> {
-    const db = this.#assertConnected()
+    this.#assertConnected()
     const expiresAt = Date.now() + ttlMs
     await this.#runWrite(() => {
-      db.prepare(
+      this.#stmt(
         `INSERT INTO "${this.#resultsTable}" (id, data, expires_at)
          VALUES (?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`
@@ -695,14 +714,14 @@ export class SQLiteStorage implements Storage {
   }
 
   async getResult (id: string): Promise<Buffer | null> {
-    const db = this.#assertConnected()
-    const row = db.prepare(`SELECT data, expires_at FROM "${this.#resultsTable}" WHERE id = ?`).get(id) as
+    this.#assertConnected()
+    const row = this.#stmt(`SELECT data, expires_at FROM "${this.#resultsTable}" WHERE id = ?`).get(id) as
       | { data?: unknown; expires_at?: number }
       | undefined
     if (!row) return null
     if (row.expires_at !== undefined && Date.now() > row.expires_at) {
       await this.#runWrite(() => {
-        db.prepare(`DELETE FROM "${this.#resultsTable}" WHERE id = ?`).run(id)
+        this.#stmt(`DELETE FROM "${this.#resultsTable}" WHERE id = ?`).run(id)
       })
       return null
     }
@@ -710,10 +729,10 @@ export class SQLiteStorage implements Storage {
   }
 
   async setError (id: string, error: Buffer, ttlMs: number): Promise<void> {
-    const db = this.#assertConnected()
+    this.#assertConnected()
     const expiresAt = Date.now() + ttlMs
     await this.#runWrite(() => {
-      db.prepare(
+      this.#stmt(
         `INSERT INTO "${this.#errorsTable}" (id, data, expires_at)
          VALUES (?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`
@@ -722,14 +741,14 @@ export class SQLiteStorage implements Storage {
   }
 
   async getError (id: string): Promise<Buffer | null> {
-    const db = this.#assertConnected()
-    const row = db.prepare(`SELECT data, expires_at FROM "${this.#errorsTable}" WHERE id = ?`).get(id) as
+    this.#assertConnected()
+    const row = this.#stmt(`SELECT data, expires_at FROM "${this.#errorsTable}" WHERE id = ?`).get(id) as
       | { data?: unknown; expires_at?: number }
       | undefined
     if (!row) return null
     if (row.expires_at !== undefined && Date.now() > row.expires_at) {
       await this.#runWrite(() => {
-        db.prepare(`DELETE FROM "${this.#errorsTable}" WHERE id = ?`).run(id)
+        this.#stmt(`DELETE FROM "${this.#errorsTable}" WHERE id = ?`).run(id)
       })
       return null
     }
@@ -741,10 +760,10 @@ export class SQLiteStorage implements Storage {
   // ═══════════════════════════════════════════════════════════════════
 
   async registerWorker (workerId: string, ttlMs: number): Promise<void> {
-    const db = this.#assertConnected()
+    this.#assertConnected()
     const expiresAt = Date.now() + ttlMs
     await this.#runWrite(() => {
-      db.prepare(
+      this.#stmt(
         `INSERT INTO "${this.#workersTable}" (worker_id, expires_at)
          VALUES (?, ?)
          ON CONFLICT(worker_id) DO UPDATE SET expires_at = excluded.expires_at`
@@ -758,26 +777,26 @@ export class SQLiteStorage implements Storage {
 
   async unregisterWorker (workerId: string): Promise<void> {
     if (!this.#db) return
-    const db = this.#db
+    this.#assertSamePid()
     await this.#runWrite(() => {
-      db.prepare(`DELETE FROM "${this.#workersTable}" WHERE worker_id = ?`).run(workerId)
-      db.prepare(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ?`).run(workerId)
+      this.#stmt(`DELETE FROM "${this.#workersTable}" WHERE worker_id = ?`).run(workerId)
+      this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ?`).run(workerId)
     })
   }
 
   async getWorkers (): Promise<string[]> {
-    const db = this.#assertConnected()
-    const rows = db
-      .prepare(`SELECT worker_id FROM "${this.#workersTable}" WHERE expires_at > ?`)
-      .all(Date.now()) as Array<{ worker_id: string }>
+    this.#assertConnected()
+    const rows = this.#stmt(`SELECT worker_id FROM "${this.#workersTable}" WHERE expires_at > ?`).all(
+      Date.now()
+    ) as Array<{ worker_id: string }>
     return rows.map(r => r.worker_id)
   }
 
   async getProcessingJobs (workerId: string): Promise<Buffer[]> {
-    const db = this.#assertConnected()
-    const rows = db
-      .prepare(`SELECT message FROM "${this.#processingTable}" WHERE worker_id = ?`)
-      .all(workerId) as Array<{ message: unknown }>
+    this.#assertConnected()
+    const rows = this.#stmt(`SELECT message FROM "${this.#processingTable}" WHERE worker_id = ?`).all(
+      workerId
+    ) as Array<{ message: unknown }>
     return rows.map(r => toBuffer(r.message))
   }
 
@@ -830,13 +849,13 @@ export class SQLiteStorage implements Storage {
     await this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
-        db.prepare(`UPDATE "${this.#jobsTable}" SET state = ?, expires_at = ? WHERE id = ?`).run(state, expiresAt, id)
-        db.prepare(
+        this.#stmt(`UPDATE "${this.#jobsTable}" SET state = ?, expires_at = ? WHERE id = ?`).run(state, expiresAt, id)
+        this.#stmt(
           `INSERT INTO "${this.#resultsTable}" (id, data, expires_at)
            VALUES (?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`
         ).run(id, result, expiresAt)
-        db.prepare(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
+        this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
         db.exec('COMMIT')
       } catch (err) {
         this.#safeRollback()
@@ -857,13 +876,13 @@ export class SQLiteStorage implements Storage {
     await this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
-        db.prepare(`UPDATE "${this.#jobsTable}" SET state = ?, expires_at = ? WHERE id = ?`).run(state, expiresAt, id)
-        db.prepare(
+        this.#stmt(`UPDATE "${this.#jobsTable}" SET state = ?, expires_at = ? WHERE id = ?`).run(state, expiresAt, id)
+        this.#stmt(
           `INSERT INTO "${this.#errorsTable}" (id, data, expires_at)
            VALUES (?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`
         ).run(id, error, expiresAt)
-        db.prepare(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
+        this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
         db.exec('COMMIT')
       } catch (err) {
         this.#safeRollback()
@@ -886,10 +905,10 @@ export class SQLiteStorage implements Storage {
     await this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
-        db.prepare(`UPDATE "${this.#jobsTable}" SET state = ? WHERE id = ?`).run(state, id)
+        this.#stmt(`UPDATE "${this.#jobsTable}" SET state = ? WHERE id = ?`).run(state, id)
         // Delete the processing row that matches by worker_id (single-process: at most one in flight).
-        db.prepare(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ?`).run(workerId)
-        db.prepare(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
+        this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ?`).run(workerId)
+        this.#stmt(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
         db.exec('COMMIT')
       } catch (err) {
         this.#safeRollback()
@@ -913,9 +932,9 @@ export class SQLiteStorage implements Storage {
     return this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
-        const row = db
-          .prepare(`SELECT owner_id, expires_at FROM "${this.#locksTable}" WHERE lock_key = ?`)
-          .get(lockKey) as { owner_id?: string; expires_at?: number } | undefined
+        const row = this.#stmt(`SELECT owner_id, expires_at FROM "${this.#locksTable}" WHERE lock_key = ?`).get(
+          lockKey
+        ) as { owner_id?: string; expires_at?: number } | undefined
 
         const now = Date.now()
         if (row && row.expires_at !== undefined && now < row.expires_at) {
@@ -923,7 +942,7 @@ export class SQLiteStorage implements Storage {
           return false
         }
 
-        db.prepare(
+        this.#stmt(
           `INSERT INTO "${this.#locksTable}" (lock_key, owner_id, expires_at)
            VALUES (?, ?, ?)
            ON CONFLICT(lock_key) DO UPDATE
@@ -939,23 +958,24 @@ export class SQLiteStorage implements Storage {
   }
 
   async renewLeaderLock (lockKey: string, ownerId: string, ttlMs: number): Promise<boolean> {
-    const db = this.#assertConnected()
+    this.#assertConnected()
     const expiresAt = Date.now() + ttlMs
     return this.#runWrite(() => {
-      const result = db
-        .prepare(`UPDATE "${this.#locksTable}" SET expires_at = ? WHERE lock_key = ? AND owner_id = ?`)
-        .run(expiresAt, lockKey, ownerId)
+      const result = this.#stmt(
+        `UPDATE "${this.#locksTable}" SET expires_at = ? WHERE lock_key = ? AND owner_id = ?`
+      ).run(expiresAt, lockKey, ownerId)
       return result.changes > 0
     })
   }
 
   async releaseLeaderLock (lockKey: string, ownerId: string): Promise<boolean> {
     if (!this.#db) return false
-    const db = this.#db
+    this.#assertSamePid()
     return this.#runWrite(() => {
-      const result = db
-        .prepare(`DELETE FROM "${this.#locksTable}" WHERE lock_key = ? AND owner_id = ?`)
-        .run(lockKey, ownerId)
+      const result = this.#stmt(`DELETE FROM "${this.#locksTable}" WHERE lock_key = ? AND owner_id = ?`).run(
+        lockKey,
+        ownerId
+      )
       return result.changes > 0
     })
   }
@@ -1017,16 +1037,16 @@ export class SQLiteStorage implements Storage {
   }
 
   async #cleanupExpired (): Promise<void> {
-    const db = this.#assertConnected()
+    this.#assertConnected()
     const now = Date.now()
     const start = now
 
     await this.#runWrite(() => {
-      db.prepare(`DELETE FROM "${this.#resultsTable}" WHERE expires_at < ?`).run(now)
-      db.prepare(`DELETE FROM "${this.#errorsTable}" WHERE expires_at < ?`).run(now)
-      db.prepare(`DELETE FROM "${this.#workersTable}" WHERE expires_at < ?`).run(now)
-      db.prepare(`DELETE FROM "${this.#jobsTable}" WHERE expires_at IS NOT NULL AND expires_at < ?`).run(now)
-      db.prepare(`DELETE FROM "${this.#locksTable}" WHERE expires_at < ?`).run(now)
+      this.#stmt(`DELETE FROM "${this.#resultsTable}" WHERE expires_at < ?`).run(now)
+      this.#stmt(`DELETE FROM "${this.#errorsTable}" WHERE expires_at < ?`).run(now)
+      this.#stmt(`DELETE FROM "${this.#workersTable}" WHERE expires_at < ?`).run(now)
+      this.#stmt(`DELETE FROM "${this.#jobsTable}" WHERE expires_at IS NOT NULL AND expires_at < ?`).run(now)
+      this.#stmt(`DELETE FROM "${this.#locksTable}" WHERE expires_at < ?`).run(now)
     })
 
     const duration = Date.now() - start
@@ -1070,6 +1090,7 @@ export class SQLiteStorage implements Storage {
    */
   async clear (): Promise<void> {
     if (!this.#db) return
+    this.#assertSamePid()
     const db = this.#db
     await this.#runWrite(() => {
       db.exec(`
