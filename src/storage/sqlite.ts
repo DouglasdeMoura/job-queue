@@ -442,7 +442,7 @@ export class SQLiteStorage implements Storage {
     }
   }
 
-  #acquireMutex (): Promise<() => void> {
+  async #acquireMutex (): Promise<() => void> {
     let resolver!: () => void
     const next = new Promise<void>(resolve => {
       resolver = resolve
