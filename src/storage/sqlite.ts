@@ -215,7 +215,7 @@ export class SQLiteStorage implements Storage {
   // Set of child namespace prefixes whose tables the root cleanup loop should
   // sweep. Populated when children connect, cleared on child disconnect.
   // Only meaningful on the root (parentStorage === null).
-  #childPrefixes: Set<string> = new Set()
+  #childPrefixes: Map<string, number> = new Map()
 
   // Table names (computed from prefix).
   #jobsTable: string
@@ -263,7 +263,7 @@ export class SQLiteStorage implements Storage {
     // Serialize concurrent connect() calls: without this, two callers both see
     // #db === null and double-increment the parent's refCount, so the root's
     // final disconnect() never actually closes the database handle.
-    if (this.#db) return
+    if (this.#db && !this.#pendingClose) return
     if (!this.#connectPromise) {
       this.#connectPromise = this.#doConnect().finally(() => {
         this.#connectPromise = null
@@ -275,26 +275,51 @@ export class SQLiteStorage implements Storage {
   async #doConnect (): Promise<void> {
     if (this.#parentStorage) {
       if (this.#db) return // already connected
-      this.#parentStorage.#refCount++
+      const parent = this.#parentStorage
+      parent.#refCount++
       try {
-        await this.#parentStorage.connect()
+        // Only open the root if it isn't open. A root whose own disconnect()
+        // is deferred (#pendingClose) must stay on course to close once its
+        // children are gone, so a child connecting doesn't revive it.
+        if (!parent.#db) await parent.connect()
       } catch (err) {
         // Roll back the refCount increment so a future parent.disconnect()
         // doesn't see a phantom child blocking its teardown.
-        this.#parentStorage.#refCount--
+        parent.#refCount--
         throw err
       }
-      this.#db = this.#parentStorage.#db
-      this.#connectedPid = this.#parentStorage.#connectedPid
-      this.#createSchema()
-      this.#checkSchemaVersion()
+      this.#db = parent.#db
+      this.#connectedPid = parent.#connectedPid
+      try {
+        this.#createSchema()
+        this.#checkSchemaVersion()
+      } catch (err) {
+        // Undo the attach: a half-connected namespace would report success on
+        // the next connect() and hold a refCount that keeps the root open.
+        this.#stmts.clear()
+        this.#db = null
+        this.#connectedPid = null
+        parent.#refCount--
+        await this.#closeParentIfPending()
+        throw err
+      }
       // Register with parent so the cleanup leader sweeps our tables too.
-      this.#parentStorage.#childPrefixes.add(this.#tablePrefix)
+      // Counted: several instances of one namespace share the same tables.
+      parent.#childPrefixes.set(this.#tablePrefix, (parent.#childPrefixes.get(this.#tablePrefix) ?? 0) + 1)
       this.#subscribeToNewJobs()
       return
     }
 
-    if (this.#db) return // idempotent
+    if (this.#db) {
+      // connect() after a deferred disconnect(): cancel the pending close and
+      // restart the timers that disconnect() stopped.
+      if (this.#pendingClose) {
+        this.#pendingClose = false
+        this.#startCleanupLeaderLoop()
+        this.#startVacuumLoop()
+      }
+      return
+    }
 
     try {
       this.#db = new DatabaseSync(this.#path)
@@ -330,6 +355,28 @@ export class SQLiteStorage implements Storage {
     this.#startVacuumLoop()
   }
 
+  #detachFromParent (): void {
+    const parent = this.#parentStorage!
+    const count = (parent.#childPrefixes.get(this.#tablePrefix) ?? 1) - 1
+    if (count > 0) {
+      parent.#childPrefixes.set(this.#tablePrefix, count)
+    } else {
+      parent.#childPrefixes.delete(this.#tablePrefix)
+    }
+    this.#stmts.clear()
+    this.#db = null
+    this.#connectedPid = null
+    parent.#refCount--
+  }
+
+  // If the root was waiting on its children to close, complete its teardown.
+  async #closeParentIfPending (): Promise<void> {
+    const parent = this.#parentStorage!
+    if (parent.#pendingClose && parent.#refCount === 0) {
+      await parent.disconnect()
+    }
+  }
+
   async disconnect (): Promise<void> {
     // Forked-child path: drop local refs only. The inherited #db points at the
     // parent process's open OS handle; closing it would corrupt the parent.
@@ -363,18 +410,18 @@ export class SQLiteStorage implements Storage {
     // Namespace path
     if (this.#parentStorage) {
       if (!this.#db) return // idempotent: already disconnected
-      const parent = this.#parentStorage
-      parent.#childPrefixes.delete(this.#tablePrefix)
       this.#clearDequeueWaiters()
       this.#removeSubscriptions()
-      this.#stmts.clear()
-      this.#db = null
-      this.#connectedPid = null
-      parent.#refCount--
-      // If root was waiting on us to close, complete its teardown now.
-      if (parent.#pendingClose && parent.#refCount === 0) {
-        await parent.disconnect()
+      // Let writes already queued on this instance finish before dropping the
+      // shared handle, as the root does before closing it.
+      const release = await this.#acquireMutex()
+      try {
+        if (!this.#db) return // a concurrent disconnect() finished first
+        this.#detachFromParent()
+      } finally {
+        release()
       }
+      await this.#closeParentIfPending()
       return
     }
 
@@ -582,7 +629,7 @@ export class SQLiteStorage implements Storage {
       ).run(OWNER_META_KEY, this.#ownerValue())
       db.exec('COMMIT')
     } catch (err) {
-      this.#safeRollback()
+      this.#safeRollback(db)
       throw err
     }
     liveOwnerInstances.add(this.#instanceId)
@@ -681,6 +728,11 @@ export class SQLiteStorage implements Storage {
   async #runWrite<T> (fn: () => T): Promise<T> {
     const release = await this.#acquireMutex()
     try {
+      // Writes queued before a disconnect() run after it; they must not touch
+      // a handle this instance no longer holds.
+      if (!this.#db) {
+        throw new StorageError('SQLiteStorage: not connected. Call connect() first.')
+      }
       let lastError: unknown
       for (let attempt = 0; attempt < WRITE_RETRY_ATTEMPTS; attempt++) {
         try {
@@ -733,9 +785,14 @@ export class SQLiteStorage implements Storage {
   // follow-up ROLLBACK then errors with "no transaction is active." That's
   // benign; log at debug so unexpected failures (closed handle, driver bug)
   // are still greppable.
-  #safeRollback (): void {
+  //
+  // Takes the handle the transaction was opened on rather than reading #db,
+  // which a concurrent disconnect() may already have cleared: skipping the
+  // ROLLBACK would leave the transaction open on a connection that namespaces
+  // share with the root, breaking every later BEGIN on it.
+  #safeRollback (db: DatabaseSync): void {
     try {
-      this.#db?.exec('ROLLBACK')
+      db.exec('ROLLBACK')
     } catch (err) {
       this.#logger.debug({ err }, 'SQLiteStorage: ROLLBACK after failed tx errored (likely auto-rolled back)')
     }
@@ -846,7 +903,7 @@ export class SQLiteStorage implements Storage {
         db.exec('COMMIT')
         return null
       } catch (err) {
-        this.#safeRollback()
+        this.#safeRollback(db)
         throw err
       }
     })
@@ -910,7 +967,7 @@ export class SQLiteStorage implements Storage {
         db.exec('COMMIT')
         return message
       } catch (err) {
-        this.#safeRollback()
+        this.#safeRollback(db)
         throw err
       }
     })
@@ -925,7 +982,7 @@ export class SQLiteStorage implements Storage {
         this.#stmt(`INSERT INTO "${this.#queueTable}" (job_id, message) VALUES (?, ?)`).run(id, message)
         db.exec('COMMIT')
       } catch (err) {
-        this.#safeRollback()
+        this.#safeRollback(db)
         throw err
       }
     })
@@ -951,9 +1008,12 @@ export class SQLiteStorage implements Storage {
 
     if (!row) return null
     const expiresAt = row.expires_at ?? null
-    if (expiresAt && Date.now() >= expiresAt) {
+    const now = Date.now()
+    if (expiresAt && now >= expiresAt) {
+      // Re-check expiry in the DELETE: an enqueue() queued ahead of this
+      // write may already have replaced the expired row with a live job.
       await this.#runWrite(() => {
-        this.#stmt(`DELETE FROM "${this.#jobsTable}" WHERE id = ?`).run(id)
+        this.#stmt(`DELETE FROM "${this.#jobsTable}" WHERE id = ? AND expires_at <= ?`).run(id, now)
       })
       return null
     }
@@ -1014,7 +1074,10 @@ export class SQLiteStorage implements Storage {
         for (let i = 0; i < expiredIds.length; i += MAX_BIND_PARAMS_PER_QUERY) {
           const chunk = expiredIds.slice(i, i + MAX_BIND_PARAMS_PER_QUERY)
           const placeholders = chunk.map(() => '?').join(',')
-          db.prepare(`DELETE FROM "${this.#jobsTable}" WHERE id IN (${placeholders})`).run(...chunk)
+          db.prepare(`DELETE FROM "${this.#jobsTable}" WHERE id IN (${placeholders}) AND expires_at <= ?`).run(
+            ...chunk,
+            now
+          )
         }
       })
     }
@@ -1056,9 +1119,11 @@ export class SQLiteStorage implements Storage {
       | { data?: unknown; expires_at?: number }
       | undefined
     if (!row) return null
-    if (row.expires_at !== undefined && Date.now() >= row.expires_at) {
+    const now = Date.now()
+    if (row.expires_at !== undefined && now >= row.expires_at) {
+      // Re-check expiry: a set queued ahead of this write may have replaced it.
       await this.#runWrite(() => {
-        this.#stmt(`DELETE FROM "${this.#resultsTable}" WHERE id = ?`).run(id)
+        this.#stmt(`DELETE FROM "${this.#resultsTable}" WHERE id = ? AND expires_at <= ?`).run(id, now)
       })
       return null
     }
@@ -1083,9 +1148,11 @@ export class SQLiteStorage implements Storage {
       | { data?: unknown; expires_at?: number }
       | undefined
     if (!row) return null
-    if (row.expires_at !== undefined && Date.now() >= row.expires_at) {
+    const now = Date.now()
+    if (row.expires_at !== undefined && now >= row.expires_at) {
+      // Re-check expiry: a set queued ahead of this write may have replaced it.
       await this.#runWrite(() => {
-        this.#stmt(`DELETE FROM "${this.#errorsTable}" WHERE id = ?`).run(id)
+        this.#stmt(`DELETE FROM "${this.#errorsTable}" WHERE id = ? AND expires_at <= ?`).run(id, now)
       })
       return null
     }
@@ -1227,7 +1294,7 @@ export class SQLiteStorage implements Storage {
         this.#deleteOneProcessingRow(workerId, message)
         db.exec('COMMIT')
       } catch (err) {
-        this.#safeRollback()
+        this.#safeRollback(db)
         throw err
       }
     })
@@ -1254,7 +1321,7 @@ export class SQLiteStorage implements Storage {
         this.#deleteOneProcessingRow(workerId, message)
         db.exec('COMMIT')
       } catch (err) {
-        this.#safeRollback()
+        this.#safeRollback(db)
         throw err
       }
     })
@@ -1286,7 +1353,7 @@ export class SQLiteStorage implements Storage {
         this.#stmt(`INSERT INTO "${this.#queueTable}" (job_id, message) VALUES (?, ?)`).run(id, message)
         db.exec('COMMIT')
       } catch (err) {
-        this.#safeRollback()
+        this.#safeRollback(db)
         throw err
       }
     })
@@ -1326,7 +1393,7 @@ export class SQLiteStorage implements Storage {
         db.exec('COMMIT')
         return true
       } catch (err) {
-        this.#safeRollback()
+        this.#safeRollback(db)
         throw err
       }
     })
@@ -1386,6 +1453,12 @@ export class SQLiteStorage implements Storage {
       }
     } else {
       const acquired = await this.acquireLeaderLock(CLEANUP_LOCK_KEY, this.#instanceId, CLEANUP_LOCK_TTL_MS)
+      if (acquired && !this.#leadershipTimer) {
+        // disconnect() stopped the loop while we waited for the write lock.
+        // Don't start a cleanup interval nothing would ever clear.
+        await this.releaseLeaderLock(CLEANUP_LOCK_KEY, this.#instanceId).catch(() => {})
+        return
+      }
       if (acquired) {
         this.#isCleanupLeader = true
         this.#startCleanupInterval()
@@ -1419,7 +1492,7 @@ export class SQLiteStorage implements Storage {
     // Sweep the root's prefix plus every registered child namespace prefix —
     // namespaces opt out of running their own cleanup loop, so without this
     // their results/errors/workers/locks/jobs rows accumulate forever.
-    const prefixes = [this.#tablePrefix, ...this.#childPrefixes]
+    const prefixes = [this.#tablePrefix, ...this.#childPrefixes.keys()]
     await this.#runWrite(() => {
       for (const prefix of prefixes) {
         this.#stmt(`DELETE FROM "${prefix}results" WHERE expires_at < ?`).run(now)

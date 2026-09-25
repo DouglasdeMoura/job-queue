@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import type { Logger } from 'pino'
 import { Queue } from '../src/queue.ts'
 import type { Job } from '../src/types.ts'
 import { SQLiteStorage } from '../src/storage/sqlite.ts'
@@ -750,6 +751,144 @@ describe('SQLiteStorage', () => {
     })
   })
 
+  describe('lifecycle races', () => {
+    it('should not leave a transaction open when a namespace disconnects with writes queued', async () => {
+      const ns = storage.createNamespace('racy')
+      const sibling = storage.createNamespace('sibling')
+      await ns.connect()
+      await sibling.connect()
+      try {
+        // Not awaited: both writes are queued behind the namespace's write
+        // lock when disconnect() runs.
+        const writes = [ns.enqueue('a', Buffer.from('a'), Date.now()), ns.enqueue('b', Buffer.from('b'), Date.now())]
+        await ns.disconnect()
+        const settled = await Promise.allSettled(writes)
+        for (const r of settled) {
+          if (r.status === 'rejected') assert.ok(r.reason instanceof StorageError, String(r.reason))
+        }
+
+        // A transaction left open on the shared connection would make every
+        // later BEGIN fail with "cannot start a transaction within a transaction".
+        await storage.enqueue('root-job', Buffer.from('root'), Date.now())
+        assert.deepStrictEqual(await storage.dequeue('w1', 1), Buffer.from('root'))
+        await sibling.enqueue('sibling-job', Buffer.from('sibling'), Date.now())
+        assert.deepStrictEqual(await sibling.dequeue('w1', 1), Buffer.from('sibling'))
+      } finally {
+        await sibling.disconnect()
+      }
+    })
+
+    it('should not start a cleanup interval when disconnect() races a leadership tick', async t => {
+      t.mock.timers.enable({ apis: ['setInterval', 'setImmediate'] })
+      const errors: string[] = []
+      const logger = {
+        fatal () {},
+        error (_obj: unknown, msg: string) {
+          errors.push(msg)
+        },
+        warn () {},
+        info () {},
+        debug () {},
+        trace () {},
+        child () {
+          return logger
+        }
+      } as unknown as Logger
+
+      try {
+        const root = new SQLiteStorage({ logger })
+        await root.connect()
+        // Fire the first leadership tick; it is now waiting for the write lock.
+        t.mock.timers.tick(0)
+        await root.disconnect()
+        await sleep(10) // real timer: let the tick's continuation run
+
+        // A leaked cleanup interval would now sweep a closed database.
+        t.mock.timers.tick(5 * 60_000)
+        await sleep(10)
+        assert.deepStrictEqual(errors, [])
+      } finally {
+        // Restore real timers before afterEach: the shared storage's intervals
+        // are real, and a mocked clearInterval would silently leave them running.
+        t.mock.timers.reset()
+      }
+    })
+
+    it('should keep a root that reconnects during a deferred disconnect', async () => {
+      const root = new SQLiteStorage()
+      const ns = root.createNamespace('child')
+      await root.connect()
+      await ns.connect()
+      try {
+        await root.disconnect() // deferred: the namespace is still connected
+        await root.connect() // the user changes their mind
+        await ns.disconnect() // must not finish closing the reconnected root
+
+        await root.enqueue('j1', Buffer.from('x'), Date.now())
+        assert.deepStrictEqual(await root.dequeue('w1', 1), Buffer.from('x'))
+
+        // Its timers were restarted: it holds cleanup leadership again.
+        await sleep(50)
+        assert.strictEqual(await root.acquireLeaderLock('cleanup-leader', 'intruder', 1000), false)
+      } finally {
+        await ns.disconnect()
+        await root.disconnect()
+      }
+      await assert.rejects(root.enqueue('j2', Buffer.from('x'), Date.now()), /not connected/)
+    })
+
+    it('should still close a root when a namespace connects during its deferred disconnect', async () => {
+      const root = new SQLiteStorage()
+      const a = root.createNamespace('a')
+      const b = root.createNamespace('b')
+      await a.connect()
+      await root.disconnect() // deferred
+      await b.connect() // must not cancel the pending close
+      await a.disconnect()
+      await b.disconnect()
+      await assert.rejects(root.enqueue('j', Buffer.from('x'), Date.now()), /not connected/)
+    })
+  })
+
+  describe('expiry cleanup on read', () => {
+    // A read that finds an expired row deletes it in a later write. A write
+    // queued in between can replace that row, and the delete must spare it.
+
+    it('should not delete a job re-enqueued while its expired state is being read', async () => {
+      await storage.enqueue('job-1', Buffer.from('first'), Date.now())
+      await storage.setJobExpiry('job-1', 1)
+      await sleep(5)
+
+      const enqueued = storage.enqueue('job-1', Buffer.from('second'), Date.now())
+      const stale = storage.getJobState('job-1') // reads the expired row first
+      const staleBatch = storage.getJobStates(['job-1'])
+
+      assert.strictEqual(await enqueued, null)
+      assert.strictEqual(await stale, null)
+      assert.strictEqual((await staleBatch).get('job-1'), null)
+      assert.match((await storage.getJobState('job-1'))!, /^queued:/)
+    })
+
+    it('should not delete a result or error rewritten while the expired one is being read', async () => {
+      await storage.setResult('job-1', Buffer.from('old'), 1)
+      await storage.setError('job-2', Buffer.from('old'), 1)
+      await sleep(5)
+
+      const writes = [
+        storage.setResult('job-1', Buffer.from('new'), 60_000),
+        storage.setError('job-2', Buffer.from('new'), 60_000)
+      ]
+      const staleResult = storage.getResult('job-1')
+      const staleError = storage.getError('job-2')
+      await Promise.all(writes)
+
+      assert.strictEqual(await staleResult, null)
+      assert.strictEqual(await staleError, null)
+      assert.deepStrictEqual(await storage.getResult('job-1'), Buffer.from('new'))
+      assert.deepStrictEqual(await storage.getError('job-2'), Buffer.from('new'))
+    })
+  })
+
   describe('namespace lifecycle (adversarial)', () => {
     it('should be idempotent on double disconnect', async () => {
       const ns = storage.createNamespace('ns-double') as SQLiteStorage
@@ -851,6 +990,60 @@ describe('SQLiteStorage (file-backed)', () => {
 
     const reopen = new SQLiteStorage({ path })
     await assert.rejects(reopen.connect(), StorageError)
+  })
+
+  describe('namespace lifecycle (file-backed)', () => {
+    it('should roll back a namespace whose connect() fails partway', async () => {
+      const first = storage.createNamespace('x')
+      await first.connect()
+      await first.disconnect()
+
+      const raw = new DatabaseSync(join(dir, 'q.sqlite'))
+      raw.exec("UPDATE \"jq_x_meta\" SET value = '999' WHERE key = 'schema_version'")
+      raw.close()
+
+      const again = storage.createNamespace('x')
+      try {
+        await assert.rejects(again.connect(), StorageError)
+        // A half-connected namespace would report success here.
+        await assert.rejects(again.connect(), StorageError)
+
+        // No phantom reference: the root closes for real.
+        await storage.disconnect()
+        await assert.rejects(storage.enqueue('j', Buffer.from('x'), Date.now()), /not connected/)
+      } finally {
+        await again.disconnect()
+      }
+    })
+
+    it('should keep sweeping a namespace while another instance of it is connected', async () => {
+      const path = join(dir, 'sweep.sqlite')
+      const root = new SQLiteStorage({ path, cleanupIntervalMs: 50 })
+      await root.connect()
+      const a = root.createNamespace('x')
+      const b = root.createNamespace('x')
+      await a.connect()
+      await b.connect()
+      try {
+        await a.disconnect()
+        await b.setResult('job-1', Buffer.from('expires'), 1)
+
+        // Counted directly: getResult() would delete the row itself.
+        const count = () => {
+          const raw = new DatabaseSync(path)
+          try {
+            return (raw.prepare('SELECT COUNT(*) AS n FROM "jq_x_results"').get() as { n: number }).n
+          } finally {
+            raw.close()
+          }
+        }
+        for (let i = 0; i < 40 && count() > 0; i++) await sleep(50)
+        assert.strictEqual(count(), 0, 'expired result in a still-connected namespace was never swept')
+      } finally {
+        await b.disconnect()
+        await root.disconnect()
+      }
+    })
   })
 
   describe('single owner per database file', () => {
