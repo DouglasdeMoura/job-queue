@@ -50,6 +50,9 @@ const sqliteStorageFactory: StorageFactory = async () => {
     storage,
     cleanup: async () => {
       await (storage as SQLiteStorage).clear()
+      // Stops the leadership/vacuum intervals even when a test fails before
+      // its queue.stop(); otherwise the timers keep the process alive.
+      await storage.disconnect()
     }
   }
 }

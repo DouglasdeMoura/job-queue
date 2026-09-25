@@ -38,6 +38,10 @@ const DEFAULT_PRAGMAS: Record<string, string | number> = {
   temp_store: 'MEMORY'
 }
 
+// Chunk size for IN-list queries; well under SQLITE_MAX_VARIABLE_NUMBER
+// (32766 by default) so bulk calls never hit the bound-parameter limit.
+const MAX_BIND_PARAMS_PER_QUERY = 500
+
 const WRITE_RETRY_BASE_MS = 5
 const WRITE_RETRY_MAX_MS = 50
 const WRITE_RETRY_ATTEMPTS = 5
@@ -46,6 +50,12 @@ interface DequeueWaiter {
   workerId: string
   resolve: (value: Buffer | null) => void
   timeoutId: ReturnType<typeof setTimeout>
+  // True while a #tryDequeue attempt for this waiter is in flight; prevents
+  // double-dispatch and tells the timeout callback to defer settling.
+  inflight: boolean
+  // Set by the timeout while an attempt is in flight; the attempt's completion
+  // settles the promise instead of the timeout.
+  timedOut: boolean
 }
 
 interface VacuumOption {
@@ -105,6 +115,21 @@ function sleep (ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+// tablePrefix and namespace names are interpolated into SQL identifiers (bind
+// parameters cannot name tables), and node:sqlite's exec() runs multiple
+// statements — a hostile name could break out of the quoted identifier and
+// execute arbitrary SQL. Allowlist the characters instead of escaping.
+const SAFE_IDENTIFIER_RE = /^[A-Za-z0-9_.:-]+$/
+
+function assertSafeIdentifier (value: string, what: string): void {
+  if (!SAFE_IDENTIFIER_RE.test(value)) {
+    throw new StorageError(
+      `SQLiteStorage: ${what} '${value}' contains characters that are not allowed ` +
+        'in SQL table names. Use only letters, digits, and _ . : -'
+    )
+  }
+}
+
 /**
  * SQLite storage implementation.
  *
@@ -138,12 +163,16 @@ export class SQLiteStorage implements Storage {
 
   #eventEmitter = new EventEmitter({ captureRejections: true })
   #notifyEmitter = new EventEmitter({ captureRejections: true })
+  // Listeners this instance registered on the (possibly shared) root emitters,
+  // so disconnect() removes exactly its own subscriptions and nothing else.
+  #subscriptions: Array<{ emitter: EventEmitter; channel: string; handler: (...args: unknown[]) => void }> = []
   #dequeueWaiters: DequeueWaiter[] = []
 
   #cleanupInterval: ReturnType<typeof setInterval> | null = null
   #leadershipTimer: ReturnType<typeof setInterval> | null = null
   #vacuumInterval: ReturnType<typeof setInterval> | null = null
   #writeMutex: Promise<void> = Promise.resolve()
+  #connectPromise: Promise<void> | null = null
 
   #instanceId = randomUUID()
   #isCleanupLeader = false
@@ -172,6 +201,7 @@ export class SQLiteStorage implements Storage {
   constructor (config: SQLiteStorageConfig = {}) {
     this.#path = config.path ?? ':memory:'
     this.#tablePrefix = config.tablePrefix ?? 'jq_'
+    assertSafeIdentifier(this.#tablePrefix, 'tablePrefix')
 
     this.#cleanupIntervalMs = config.cleanupIntervalMs ?? DEFAULT_CLEANUP_INTERVAL_MS
     this.#vacuum =
@@ -201,6 +231,19 @@ export class SQLiteStorage implements Storage {
   // ═══════════════════════════════════════════════════════════════════
 
   async connect (): Promise<void> {
+    // Serialize concurrent connect() calls: without this, two callers both see
+    // #db === null and double-increment the parent's refCount, so the root's
+    // final disconnect() never actually closes the database handle.
+    if (this.#db) return
+    if (!this.#connectPromise) {
+      this.#connectPromise = this.#doConnect().finally(() => {
+        this.#connectPromise = null
+      })
+    }
+    return this.#connectPromise
+  }
+
+  async #doConnect (): Promise<void> {
     if (this.#parentStorage) {
       if (this.#db) return // already connected
       this.#parentStorage.#refCount++
@@ -215,6 +258,7 @@ export class SQLiteStorage implements Storage {
       this.#db = this.#parentStorage.#db
       this.#connectedPid = this.#parentStorage.#connectedPid
       this.#createSchema()
+      this.#checkSchemaVersion()
       // Register with parent so the cleanup leader sweeps our tables too.
       this.#parentStorage.#childPrefixes.add(this.#tablePrefix)
       return
@@ -260,8 +304,7 @@ export class SQLiteStorage implements Storage {
       this.#connectedPid = null
       this.#stmts.clear()
       this.#clearDequeueWaiters()
-      this.#eventEmitter.removeAllListeners()
-      this.#notifyEmitter.removeAllListeners()
+      this.#removeSubscriptions()
       return
     }
 
@@ -271,8 +314,7 @@ export class SQLiteStorage implements Storage {
       const parent = this.#parentStorage
       parent.#childPrefixes.delete(this.#tablePrefix)
       this.#clearDequeueWaiters()
-      this.#eventEmitter.removeAllListeners()
-      this.#notifyEmitter.removeAllListeners()
+      this.#removeSubscriptions()
       this.#stmts.clear()
       this.#db = null
       this.#connectedPid = null
@@ -322,6 +364,7 @@ export class SQLiteStorage implements Storage {
     const release = await this.#acquireMutex()
     try {
       this.#clearDequeueWaiters()
+      this.#removeSubscriptions()
       this.#eventEmitter.removeAllListeners()
       this.#notifyEmitter.removeAllListeners()
       this.#stmts.clear()
@@ -548,23 +591,53 @@ export class SQLiteStorage implements Storage {
   }
 
   #notifyDequeueWaiters (): void {
-    // Pop waiters and try to give each a message. Each attempt is its own write tx.
-    const waiters = this.#dequeueWaiters.splice(0)
-    for (const waiter of waiters) {
+    // Try to hand each parked waiter a message. Each attempt is its own write
+    // tx. Waiters stay in #dequeueWaiters until their promise settles: removing
+    // them earlier races the dequeue timeout, which could resolve null while
+    // #tryDequeue commits a message into the processing table — silently losing
+    // the job.
+    for (const waiter of [...this.#dequeueWaiters]) {
+      if (waiter.inflight) continue
+      waiter.inflight = true
       this.#tryDequeue(waiter.workerId)
         .then(msg => {
+          waiter.inflight = false
           if (msg) {
             clearTimeout(waiter.timeoutId)
+            this.#removeDequeueWaiter(waiter)
             waiter.resolve(msg)
-          } else {
-            this.#dequeueWaiters.push(waiter)
+          } else if (waiter.timedOut) {
+            this.#removeDequeueWaiter(waiter)
+            waiter.resolve(null)
           }
         })
         .catch(err => {
+          waiter.inflight = false
           this.#logger.error({ err }, 'SQLiteStorage: dequeue waiter failed; will retry')
-          this.#dequeueWaiters.push(waiter)
+          if (waiter.timedOut) {
+            this.#removeDequeueWaiter(waiter)
+            waiter.resolve(null)
+          }
         })
     }
+  }
+
+  #removeDequeueWaiter (waiter: DequeueWaiter): void {
+    const index = this.#dequeueWaiters.indexOf(waiter)
+    if (index !== -1) this.#dequeueWaiters.splice(index, 1)
+  }
+
+  // Deletes exactly one matching in-flight row (the oldest). A bare
+  // worker_id+message predicate would wipe every byte-identical sibling
+  // message the worker holds, losing their crash-recovery records.
+  #deleteOneProcessingRow (workerId: string, message: Buffer): void {
+    this.#stmt(
+      `DELETE FROM "${this.#processingTable}" WHERE seq = (
+         SELECT seq FROM "${this.#processingTable}"
+          WHERE worker_id = ? AND message = ?
+          ORDER BY seq LIMIT 1
+       )`
+    ).run(workerId, message)
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -604,7 +677,7 @@ export class SQLiteStorage implements Storage {
     })
 
     if (existing === null) {
-      this.#eventEmitter.emit('event', id, 'queued')
+      this.#events().emit(this.#eventChannel(), id, 'queued')
       this.#notifyDequeueWaiters()
     }
 
@@ -617,13 +690,23 @@ export class SQLiteStorage implements Storage {
     if (immediate) return immediate
 
     return new Promise<Buffer | null>(resolve => {
-      const timeoutId = setTimeout(() => {
-        const index = this.#dequeueWaiters.findIndex(w => w.resolve === resolve)
-        if (index !== -1) this.#dequeueWaiters.splice(index, 1)
-        resolve(null)
-      }, timeout * 1000)
-
-      this.#dequeueWaiters.push({ workerId, resolve, timeoutId })
+      const waiter: DequeueWaiter = {
+        workerId,
+        resolve,
+        inflight: false,
+        timedOut: false,
+        timeoutId: setTimeout(() => {
+          if (waiter.inflight) {
+            // An attempt may already have claimed a message for this waiter;
+            // let its completion settle the promise so the message isn't lost.
+            waiter.timedOut = true
+            return
+          }
+          this.#removeDequeueWaiter(waiter)
+          resolve(null)
+        }, timeout * 1000)
+      }
+      this.#dequeueWaiters.push(waiter)
     })
   }
 
@@ -659,7 +742,7 @@ export class SQLiteStorage implements Storage {
     await this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
-        this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
+        this.#deleteOneProcessingRow(workerId, message)
         this.#stmt(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
         db.exec('COMMIT')
       } catch (err) {
@@ -673,7 +756,7 @@ export class SQLiteStorage implements Storage {
   async ack (id: string, message: Buffer, workerId: string): Promise<void> {
     this.#assertConnected()
     await this.#runWrite(() => {
-      this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
+      this.#deleteOneProcessingRow(workerId, message)
     })
   }
 
@@ -712,7 +795,7 @@ export class SQLiteStorage implements Storage {
       return result.changes
     })
     if (changes > 0) {
-      this.#eventEmitter.emit('event', id, 'cancelled')
+      this.#events().emit(this.#eventChannel(), id, 'cancelled')
       return true
     }
     return false
@@ -723,31 +806,37 @@ export class SQLiteStorage implements Storage {
     if (ids.length === 0) return result
 
     const db = this.#assertConnected()
-    // Bypass the #stmts cache for variable-arity IN-list SQL — caching here
-    // would grow the cache by one entry per distinct batch size.
-    const placeholders = ids.map(() => '?').join(',')
-    const rows = db
-      .prepare(`SELECT id, state, expires_at FROM "${this.#jobsTable}" WHERE id IN (${placeholders})`)
-      .all(...ids) as Array<{ id: string; state: string; expires_at: number | null }>
-
     const now = Date.now()
     const found = new Set<string>()
     const expiredIds: string[] = []
 
-    for (const row of rows) {
-      found.add(row.id)
-      if (row.expires_at && now >= row.expires_at) {
-        expiredIds.push(row.id)
-        result.set(row.id, null)
-      } else {
-        result.set(row.id, row.state)
+    for (let i = 0; i < ids.length; i += MAX_BIND_PARAMS_PER_QUERY) {
+      const chunk = ids.slice(i, i + MAX_BIND_PARAMS_PER_QUERY)
+      // Bypass the #stmts cache for variable-arity IN-list SQL — caching here
+      // would grow the cache by one entry per distinct batch size.
+      const placeholders = chunk.map(() => '?').join(',')
+      const rows = db
+        .prepare(`SELECT id, state, expires_at FROM "${this.#jobsTable}" WHERE id IN (${placeholders})`)
+        .all(...chunk) as Array<{ id: string; state: string; expires_at: number | null }>
+
+      for (const row of rows) {
+        found.add(row.id)
+        if (row.expires_at && now >= row.expires_at) {
+          expiredIds.push(row.id)
+          result.set(row.id, null)
+        } else {
+          result.set(row.id, row.state)
+        }
       }
     }
 
     if (expiredIds.length > 0) {
-      const expiredPlaceholders = expiredIds.map(() => '?').join(',')
       await this.#runWrite(() => {
-        db.prepare(`DELETE FROM "${this.#jobsTable}" WHERE id IN (${expiredPlaceholders})`).run(...expiredIds)
+        for (let i = 0; i < expiredIds.length; i += MAX_BIND_PARAMS_PER_QUERY) {
+          const chunk = expiredIds.slice(i, i + MAX_BIND_PARAMS_PER_QUERY)
+          const placeholders = chunk.map(() => '?').join(',')
+          db.prepare(`DELETE FROM "${this.#jobsTable}" WHERE id IN (${placeholders})`).run(...chunk)
+        }
       })
     }
 
@@ -873,20 +962,55 @@ export class SQLiteStorage implements Storage {
   // NOTIFICATIONS (in-process only)
   // ═══════════════════════════════════════════════════════════════════
 
+  // Events and notifications go through the ROOT's emitters on channels scoped
+  // by table prefix, so every namespace instance created for the same name
+  // shares a channel (mirroring Redis/Pg prefix-keyed pub/sub) while distinct
+  // namespaces stay isolated. Per-instance emitters would strand a Reaper or
+  // enqueueAndWait producer that holds its own createNamespace(name) instance.
+  #events (): EventEmitter {
+    return (this.#parentStorage ?? this).#eventEmitter
+  }
+
+  #notifications (): EventEmitter {
+    return (this.#parentStorage ?? this).#notifyEmitter
+  }
+
+  #eventChannel (): string {
+    return `event:${this.#tablePrefix}`
+  }
+
+  #notifyChannel (id: string): string {
+    return `notify:${this.#tablePrefix}:${id}`
+  }
+
+  #subscribe (emitter: EventEmitter, channel: string, handler: (...args: unknown[]) => void): () => Promise<void> {
+    const sub = { emitter, channel, handler }
+    emitter.on(channel, handler)
+    this.#subscriptions.push(sub)
+    return async () => {
+      emitter.off(channel, handler)
+      const index = this.#subscriptions.indexOf(sub)
+      if (index !== -1) this.#subscriptions.splice(index, 1)
+    }
+  }
+
+  #removeSubscriptions (): void {
+    for (const sub of this.#subscriptions) {
+      sub.emitter.off(sub.channel, sub.handler)
+    }
+    this.#subscriptions = []
+  }
+
   async subscribeToJob (
     id: string,
     handler: (status: 'completed' | 'failed' | 'failing') => void
   ): Promise<() => Promise<void>> {
-    const eventName = `notify:${id}`
-    this.#notifyEmitter.on(eventName, handler)
-    return async () => {
-      this.#notifyEmitter.off(eventName, handler)
-    }
+    return this.#subscribe(this.#notifications(), this.#notifyChannel(id), handler as (...args: unknown[]) => void)
   }
 
   async notifyJobComplete (id: string, status: 'completed' | 'failed' | 'failing'): Promise<void> {
     this.#assertConnected()
-    this.#notifyEmitter.emit(`notify:${id}`, status)
+    this.#notifications().emit(this.#notifyChannel(id), status)
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -894,15 +1018,12 @@ export class SQLiteStorage implements Storage {
   // ═══════════════════════════════════════════════════════════════════
 
   async subscribeToEvents (handler: (id: string, event: string) => void): Promise<() => Promise<void>> {
-    this.#eventEmitter.on('event', handler)
-    return async () => {
-      this.#eventEmitter.off('event', handler)
-    }
+    return this.#subscribe(this.#events(), this.#eventChannel(), handler as (...args: unknown[]) => void)
   }
 
   async publishEvent (id: string, event: string): Promise<void> {
     this.#assertConnected()
-    this.#eventEmitter.emit('event', id, event)
+    this.#events().emit(this.#eventChannel(), id, event)
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -924,7 +1045,7 @@ export class SQLiteStorage implements Storage {
            VALUES (?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`
         ).run(id, result, expiresAt)
-        this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
+        this.#deleteOneProcessingRow(workerId, message)
         db.exec('COMMIT')
       } catch (err) {
         this.#safeRollback()
@@ -932,8 +1053,8 @@ export class SQLiteStorage implements Storage {
       }
     })
 
-    this.#notifyEmitter.emit(`notify:${id}`, 'completed')
-    this.#eventEmitter.emit('event', id, 'completed')
+    this.#notifications().emit(this.#notifyChannel(id), 'completed')
+    this.#events().emit(this.#eventChannel(), id, 'completed')
   }
 
   async failJob (id: string, message: Buffer, workerId: string, error: Buffer, errorTTL: number): Promise<void> {
@@ -951,7 +1072,7 @@ export class SQLiteStorage implements Storage {
            VALUES (?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`
         ).run(id, error, expiresAt)
-        this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE worker_id = ? AND message = ?`).run(workerId, message)
+        this.#deleteOneProcessingRow(workerId, message)
         db.exec('COMMIT')
       } catch (err) {
         this.#safeRollback()
@@ -959,8 +1080,8 @@ export class SQLiteStorage implements Storage {
       }
     })
 
-    this.#notifyEmitter.emit(`notify:${id}`, 'failed')
-    this.#eventEmitter.emit('event', id, 'failed')
+    this.#notifications().emit(this.#notifyChannel(id), 'failed')
+    this.#events().emit(this.#eventChannel(), id, 'failed')
   }
 
   async retryJob (id: string, message: Buffer, workerId: string, attempts: number): Promise<void> {
@@ -968,30 +1089,33 @@ export class SQLiteStorage implements Storage {
     const timestamp = Date.now()
     const state = `failing:${timestamp}:${attempts}`
 
-    // `message` here is the NEW retry payload (with incremented attempts), not
-    // the bytes sitting in processing. Find the in-flight row for this id by
-    // JSON-parsing each of the worker's processing rows. Mirrors pg.ts. If the
-    // app uses a non-JSON serde, no row matches and the stale row is left for
-    // the reaper to recover — slower, but never wipes sibling in-flight jobs.
-    let oldSeq: number | null = null
-    const rows = this.#stmt(`SELECT seq, message FROM "${this.#processingTable}" WHERE worker_id = ?`).all(
-      workerId
-    ) as Array<{ seq: number; message: unknown }>
-    for (const row of rows) {
-      try {
-        const parsed = JSON.parse(toBuffer(row.message).toString()) as { id?: unknown }
-        if (parsed && parsed.id === id) {
-          oldSeq = row.seq
-          break
-        }
-      } catch {
-        // non-JSON payload; skip
-      }
-    }
-
     await this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
+        // `message` here is the NEW retry payload (with incremented attempts),
+        // not the bytes sitting in processing. Find the in-flight row for this
+        // id by JSON-parsing each of the worker's processing rows. Mirrors
+        // pg.ts. If the app uses a non-JSON serde, no row matches and the stale
+        // row is left for the reaper to recover — slower, but never wipes
+        // sibling in-flight jobs. The scan runs inside the transaction: outside
+        // it, a concurrent write (reaper recovery, unregisterWorker) could
+        // requeue the same row before our DELETE, double-running the job.
+        let oldSeq: number | null = null
+        const rows = this.#stmt(`SELECT seq, message FROM "${this.#processingTable}" WHERE worker_id = ?`).all(
+          workerId
+        ) as Array<{ seq: number; message: unknown }>
+        for (const row of rows) {
+          try {
+            const parsed = JSON.parse(toBuffer(row.message).toString()) as { id?: unknown }
+            if (parsed && parsed.id === id) {
+              oldSeq = row.seq
+              break
+            }
+          } catch {
+            // non-JSON payload; skip
+          }
+        }
+
         this.#stmt(`UPDATE "${this.#jobsTable}" SET state = ? WHERE id = ?`).run(state, id)
         if (oldSeq !== null) {
           this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE seq = ?`).run(oldSeq)
@@ -1004,8 +1128,8 @@ export class SQLiteStorage implements Storage {
       }
     })
 
-    this.#notifyEmitter.emit(`notify:${id}`, 'failing')
-    this.#eventEmitter.emit('event', id, 'failing')
+    this.#notifications().emit(this.#notifyChannel(id), 'failing')
+    this.#events().emit(this.#eventChannel(), id, 'failing')
     this.#notifyDequeueWaiters()
   }
 
@@ -1154,9 +1278,14 @@ export class SQLiteStorage implements Storage {
     if (this.#parentStorage) return
     this.#vacuumInterval = setInterval(() => {
       this.#runWrite(() => {
-        this.#db?.exec('PRAGMA optimize')
+        const db = this.#db
+        if (!db) return
+        db.exec('PRAGMA optimize')
+        // VACUUM is what actually reclaims disk space after large delete
+        // sweeps; PRAGMA optimize alone never shrinks the file.
+        db.exec('VACUUM')
       }).catch(err => {
-        this.#logger.warn({ err }, 'SQLiteStorage: pragma optimize failed')
+        this.#logger.warn({ err }, 'SQLiteStorage: vacuum failed')
       })
     }, this.#vacuum.intervalMs)
   }
@@ -1166,6 +1295,7 @@ export class SQLiteStorage implements Storage {
   // ═══════════════════════════════════════════════════════════════════
 
   createNamespace (name: string): Storage {
+    assertSafeIdentifier(name, 'namespace name')
     const root = this.#parentStorage ?? this
     const ns = new SQLiteStorage({
       path: root.#path,
