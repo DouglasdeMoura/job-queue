@@ -906,6 +906,27 @@ describe('SQLiteStorage', () => {
       }
     })
 
+    it('should close a root the user disconnected while a namespace was restarting', async () => {
+      // e.g. a named Queue restarted (stop() + start()) while the app shuts
+      // the shared storage down. The namespace's connect() was issued before
+      // root.disconnect(), so it stays attached and the root closes once it
+      // leaves — the delayed connect must not reopen a root closed meanwhile.
+      const root = new SQLiteStorage()
+      const ns = root.createNamespace('restarting')
+      await root.connect()
+      await ns.connect()
+      try {
+        await Promise.all([ns.disconnect(), ns.connect(), root.disconnect()])
+        await ns.getWorkers() // connect() was the namespace's last word
+
+        await ns.disconnect()
+        await assert.rejects(root.getWorkers(), /not connected/)
+      } finally {
+        await ns.disconnect()
+        await root.disconnect()
+      }
+    })
+
     it('should honour disconnect() called while a namespace connect() is in flight', async () => {
       for (const rootConnected of [true, false]) {
         const root = new SQLiteStorage()

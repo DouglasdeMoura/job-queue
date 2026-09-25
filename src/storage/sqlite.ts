@@ -276,7 +276,22 @@ export class SQLiteStorage implements Storage {
   // in flight would see nothing to tear down and return, leaving the instance
   // attached once the connect lands.
   async connect (): Promise<void> {
-    return this.#serializeLifecycle(() => this.#doConnect())
+    const parent = this.#parentStorage
+    if (!parent) return this.#serializeLifecycle(() => this.#doConnect())
+
+    // A namespace registers with its root when connect() is CALLED, not when
+    // its own lifecycle chain gets to it (which may be much later, e.g. behind
+    // a disconnect() waiting on the root). Root operations then take effect
+    // in call order: a root.disconnect() issued after this call sees the
+    // reference and defers, and the "open the root if closed" step is queued
+    // on the root's chain ahead of it, so it can't reopen a root the user
+    // closed afterwards. #doConnectNamespace releases the reference if it
+    // doesn't end up attaching.
+    parent.#refCount++
+    const rootOpen = parent.#serializeLifecycle(async () => {
+      if (!parent.#db) await parent.#doConnect()
+    })
+    return this.#serializeLifecycle(() => this.#doConnectNamespace(parent, rootOpen))
   }
 
   #serializeLifecycle (fn: () => Promise<void>): Promise<void> {
@@ -285,26 +300,11 @@ export class SQLiteStorage implements Storage {
     return run
   }
 
-  async #doConnect (): Promise<void> {
-    if (this.#parentStorage) {
-      if (this.#db) return // already connected
-      const parent = this.#parentStorage
-      parent.#refCount++
-      try {
-        // Open the root only if it is closed when this runs on the root's
-        // lifecycle chain — not when we queue it: a user's disconnect() or
-        // connect() queued in between must keep its meaning. A root whose own
-        // disconnect() is deferred (#pendingClose) must stay on course to close
-        // once its children are gone, so a child connecting doesn't revive it.
-        await parent.#serializeLifecycle(async () => {
-          if (!parent.#db) await parent.#doConnect()
-        })
-      } catch (err) {
-        // Roll back the refCount increment so a future parent.disconnect()
-        // doesn't see a phantom child blocking its teardown.
-        parent.#refCount--
-        throw err
-      }
+  async #doConnectNamespace (parent: SQLiteStorage, rootOpen: Promise<void>): Promise<void> {
+    let attached = false
+    try {
+      await rootOpen
+      if (this.#db) return // already connected; this call's reference is released below
       this.#db = parent.#db
       this.#connectedPid = parent.#connectedPid
       try {
@@ -312,21 +312,28 @@ export class SQLiteStorage implements Storage {
         this.#checkSchemaVersion()
       } catch (err) {
         // Undo the attach: a half-connected namespace would report success on
-        // the next connect() and hold a refCount that keeps the root open.
+        // the next connect() and keep the root open.
         this.#stmts.clear()
         this.#db = null
         this.#connectedPid = null
-        parent.#refCount--
-        await this.#closeParentIfPending()
         throw err
       }
+      attached = true
       // Register with parent so the cleanup leader sweeps our tables too.
       // Counted: several instances of one namespace share the same tables.
       parent.#childPrefixes.set(this.#tablePrefix, (parent.#childPrefixes.get(this.#tablePrefix) ?? 0) + 1)
       this.#subscribeToNewJobs()
-      return
+    } finally {
+      if (!attached) {
+        // Release the reference taken in connect() so a pending root close
+        // isn't blocked by a namespace that never attached.
+        parent.#refCount--
+        await this.#closeParentIfPending()
+      }
     }
+  }
 
+  async #doConnect (): Promise<void> {
     if (this.#db) {
       // connect() after a deferred disconnect(): cancel the pending close and
       // restart the timers that disconnect() stopped.
@@ -935,7 +942,12 @@ export class SQLiteStorage implements Storage {
           return
         }
         this.#logger.error({ err }, 'SQLiteStorage: dequeue waiter failed; will retry')
-        if (waiter.timedOut) this.#settleDequeueWaiter(waiter, null)
+        if (waiter.timedOut) {
+          this.#settleDequeueWaiter(waiter, null)
+        } else if (waiter.renotify) {
+          // A job was announced while this attempt was failing; don't drop it.
+          this.#attemptDequeue(waiter, false)
+        }
       }
     )
   }
