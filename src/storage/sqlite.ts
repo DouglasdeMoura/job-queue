@@ -66,6 +66,7 @@ const WRITE_RETRY_ATTEMPTS = 5
 interface DequeueWaiter {
   workerId: string
   resolve: (value: Buffer | null) => void
+  reject: (err: unknown) => void
   timeoutId: ReturnType<typeof setTimeout>
   // True while a #tryDequeue attempt for this waiter is in flight; prevents
   // double-dispatch and tells the timeout callback to defer settling.
@@ -73,6 +74,16 @@ interface DequeueWaiter {
   // Set by the timeout while an attempt is in flight; the attempt's completion
   // settles the promise instead of the timeout.
   timedOut: boolean
+  // A new job was announced while an attempt was in flight. That attempt may
+  // already have looked at the queue, so try again once it comes back empty.
+  renotify: boolean
+  // Set by disconnect(). The promise has been settled with null; attempts
+  // that haven't run yet must not claim anything for this waiter.
+  abandoned: boolean
+  // The job an attempt claimed for this waiter, recorded in the same
+  // synchronous transaction that moved it to processing and cleared once it is
+  // handed over. disconnect() puts it back in the queue if it is still here.
+  claimed: { jobId: string; message: Buffer } | null
 }
 
 interface VacuumOption {
@@ -201,7 +212,7 @@ export class SQLiteStorage implements Storage {
   #vacuumInterval: ReturnType<typeof setInterval> | null = null
   #ownerHeartbeat: ReturnType<typeof setInterval> | null = null
   #writeMutex: Promise<void> = Promise.resolve()
-  #connectPromise: Promise<void> | null = null
+  #lifecycle: Promise<void> = Promise.resolve()
 
   #instanceId = randomUUID()
   #isCleanupLeader = false
@@ -259,17 +270,19 @@ export class SQLiteStorage implements Storage {
   // LIFECYCLE
   // ═══════════════════════════════════════════════════════════════════
 
+  // connect() and disconnect() on one instance run one at a time, in call
+  // order. Overlapping calls otherwise race: two connects double-count the
+  // parent's refCount, and a disconnect() issued while a connect() is still
+  // in flight would see nothing to tear down and return, leaving the instance
+  // attached once the connect lands.
   async connect (): Promise<void> {
-    // Serialize concurrent connect() calls: without this, two callers both see
-    // #db === null and double-increment the parent's refCount, so the root's
-    // final disconnect() never actually closes the database handle.
-    if (this.#db && !this.#pendingClose) return
-    if (!this.#connectPromise) {
-      this.#connectPromise = this.#doConnect().finally(() => {
-        this.#connectPromise = null
-      })
-    }
-    return this.#connectPromise
+    return this.#serializeLifecycle(() => this.#doConnect())
+  }
+
+  #serializeLifecycle (fn: () => Promise<void>): Promise<void> {
+    const run = this.#lifecycle.then(fn)
+    this.#lifecycle = run.catch(() => {})
+    return run
   }
 
   async #doConnect (): Promise<void> {
@@ -378,23 +391,16 @@ export class SQLiteStorage implements Storage {
   }
 
   async disconnect (): Promise<void> {
+    return this.#serializeLifecycle(() => this.#doDisconnect())
+  }
+
+  async #doDisconnect (): Promise<void> {
     // Forked-child path: drop local refs only. The inherited #db points at the
     // parent process's open OS handle; closing it would corrupt the parent.
     // Also don't touch parent.#refCount — that's parent's bookkeeping. Clearing
     // local timers IS safe (each process has its own event loop).
     if (this.#db && this.#connectedPid !== null && process.pid !== this.#connectedPid) {
-      if (this.#leadershipTimer) {
-        clearInterval(this.#leadershipTimer)
-        this.#leadershipTimer = null
-      }
-      if (this.#cleanupInterval) {
-        clearInterval(this.#cleanupInterval)
-        this.#cleanupInterval = null
-      }
-      if (this.#vacuumInterval) {
-        clearInterval(this.#vacuumInterval)
-        this.#vacuumInterval = null
-      }
+      this.#stopTimers()
       if (this.#ownerHeartbeat) {
         clearInterval(this.#ownerHeartbeat)
         this.#ownerHeartbeat = null
@@ -410,17 +416,19 @@ export class SQLiteStorage implements Storage {
     // Namespace path
     if (this.#parentStorage) {
       if (!this.#db) return // idempotent: already disconnected
-      this.#clearDequeueWaiters()
       this.#removeSubscriptions()
       // Let writes already queued on this instance finish before dropping the
       // shared handle, as the root does before closing it.
       const release = await this.#acquireMutex()
+      let requeued = 0
       try {
-        if (!this.#db) return // a concurrent disconnect() finished first
+        requeued = this.#abandonDequeueWaiters(this.#db)
         this.#detachFromParent()
       } finally {
         release()
       }
+      // Wake other instances of this namespace for the jobs we put back.
+      if (requeued > 0) this.#announceNewJob()
       await this.#closeParentIfPending()
       return
     }
@@ -428,41 +436,37 @@ export class SQLiteStorage implements Storage {
     // Root path: idempotent
     if (!this.#db) return
 
+    // Marks the close as requested before the first await, so a connect()
+    // that arrives while we wait below cancels it (see #doConnect) and we
+    // back off instead of closing a handle the caller now expects to be open.
+    this.#pendingClose = true
+
     // Tear down timers first so cleanup/leadership/vacuum ticks don't enqueue
     // new writes after we start closing.
-    if (this.#leadershipTimer) {
-      clearInterval(this.#leadershipTimer)
-      this.#leadershipTimer = null
-    }
-    if (this.#cleanupInterval) {
-      clearInterval(this.#cleanupInterval)
-      this.#cleanupInterval = null
-    }
-    if (this.#vacuumInterval) {
-      clearInterval(this.#vacuumInterval)
-      this.#vacuumInterval = null
-    }
+    this.#stopTimers()
 
     if (this.#isCleanupLeader) {
+      this.#isCleanupLeader = false
       try {
         await this.releaseLeaderLock(CLEANUP_LOCK_KEY, this.#instanceId)
       } catch {
         // best-effort
       }
-      this.#isCleanupLeader = false
     }
 
     // If children are still connected, defer the actual close. The last child
     // to disconnect re-triggers this path.
-    if (this.#refCount > 0) {
-      this.#pendingClose = true
-      return
-    }
+    if (this.#refCount > 0) return
 
     // Drain in-flight writes by acquiring the mutex before closing the handle.
     const release = await this.#acquireMutex()
     try {
-      this.#clearDequeueWaiters()
+      // Re-check under the lock; everything below is synchronous, so nothing
+      // can slip in between these checks and the close.
+      if (!this.#db || !this.#pendingClose) return // closed already, or reconnected
+      if (this.#refCount > 0) return // a namespace attached; it closes us when it leaves
+
+      this.#abandonDequeueWaiters(this.#db)
       this.#removeSubscriptions()
       this.#eventEmitter.removeAllListeners()
       this.#notifyEmitter.removeAllListeners()
@@ -475,18 +479,31 @@ export class SQLiteStorage implements Storage {
       this.#releaseOwnership()
       this.#stmts.clear()
 
-      if (this.#db) {
-        try {
-          this.#db.close()
-        } catch {
-          // best-effort
-        }
-        this.#db = null
+      try {
+        this.#db.close()
+      } catch {
+        // best-effort
       }
+      this.#db = null
       this.#connectedPid = null
       this.#pendingClose = false
     } finally {
       release()
+    }
+  }
+
+  #stopTimers (): void {
+    if (this.#leadershipTimer) {
+      clearInterval(this.#leadershipTimer)
+      this.#leadershipTimer = null
+    }
+    if (this.#cleanupInterval) {
+      clearInterval(this.#cleanupInterval)
+      this.#cleanupInterval = null
+    }
+    if (this.#vacuumInterval) {
+      clearInterval(this.#vacuumInterval)
+      this.#vacuumInterval = null
     }
   }
 
@@ -798,12 +815,58 @@ export class SQLiteStorage implements Storage {
     }
   }
 
+  // Forked-child path only: the handle belongs to the parent process, so
+  // nothing can be written back.
   #clearDequeueWaiters (): void {
     for (const waiter of this.#dequeueWaiters) {
+      waiter.abandoned = true
       clearTimeout(waiter.timeoutId)
       waiter.resolve(null)
     }
     this.#dequeueWaiters = []
+  }
+
+  // Called by disconnect() while holding the write lock. Settles every parked
+  // dequeue with null and returns to the queue any job an attempt claimed but
+  // hasn't handed over yet — otherwise it would sit in processing under a
+  // worker that is shutting down (and usually already unregistered), where
+  // the reaper never looks. Attempts that run after this see `abandoned` and
+  // claim nothing. Returns the number of jobs put back.
+  #abandonDequeueWaiters (db: DatabaseSync): number {
+    const waiters = this.#dequeueWaiters
+    this.#dequeueWaiters = []
+    const stranded: Array<{ workerId: string; jobId: string; message: Buffer }> = []
+    for (const waiter of waiters) {
+      waiter.abandoned = true
+      clearTimeout(waiter.timeoutId)
+      if (waiter.claimed) stranded.push({ workerId: waiter.workerId, ...waiter.claimed })
+      waiter.claimed = null
+      waiter.resolve(null)
+    }
+    if (stranded.length === 0) return 0
+
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      for (const { workerId, jobId, message } of stranded) {
+        this.#stmt(
+          `DELETE FROM "${this.#processingTable}" WHERE seq = (
+             SELECT seq FROM "${this.#processingTable}"
+              WHERE worker_id = ? AND job_id = ?
+              ORDER BY seq LIMIT 1
+           )`
+        ).run(workerId, jobId)
+        this.#stmt(`INSERT INTO "${this.#queueTable}" (job_id, message) VALUES (?, ?)`).run(jobId, message)
+      }
+      db.exec('COMMIT')
+    } catch (err) {
+      this.#safeRollback(db)
+      this.#logger.error(
+        { err, count: stranded.length },
+        'SQLiteStorage: failed to requeue jobs claimed during disconnect'
+      )
+      return 0
+    }
+    return stranded.length
   }
 
   // Dequeue wake-ups go through the root's emitter on a prefix-scoped channel,
@@ -823,35 +886,58 @@ export class SQLiteStorage implements Storage {
   }
 
   #notifyDequeueWaiters (): void {
-    // Try to hand each parked waiter a message. Each attempt is its own write
-    // tx. Waiters stay in #dequeueWaiters until their promise settles: removing
-    // them earlier races the dequeue timeout, which could resolve null while
-    // #tryDequeue commits a message into the processing table — silently losing
-    // the job.
     for (const waiter of [...this.#dequeueWaiters]) {
-      if (waiter.inflight) continue
-      waiter.inflight = true
-      this.#tryDequeue(waiter.workerId)
-        .then(msg => {
-          waiter.inflight = false
-          if (msg) {
-            clearTimeout(waiter.timeoutId)
-            this.#removeDequeueWaiter(waiter)
-            waiter.resolve(msg)
-          } else if (waiter.timedOut) {
-            this.#removeDequeueWaiter(waiter)
-            waiter.resolve(null)
-          }
-        })
-        .catch(err => {
-          waiter.inflight = false
-          this.#logger.error({ err }, 'SQLiteStorage: dequeue waiter failed; will retry')
-          if (waiter.timedOut) {
-            this.#removeDequeueWaiter(waiter)
-            waiter.resolve(null)
-          }
-        })
+      this.#attemptDequeue(waiter, false)
     }
+  }
+
+  // Try to hand a parked waiter a message. Each attempt is its own write tx.
+  // Waiters stay in #dequeueWaiters until their promise settles: removing them
+  // earlier races the dequeue timeout, which could resolve null while
+  // #tryDequeue commits a message into the processing table — silently losing
+  // the job.
+  #attemptDequeue (waiter: DequeueWaiter, first: boolean): void {
+    if (waiter.abandoned) return
+    if (waiter.inflight) {
+      waiter.renotify = true
+      return
+    }
+    waiter.inflight = true
+    waiter.renotify = false
+    this.#tryDequeue(waiter).then(
+      msg => {
+        waiter.inflight = false
+        if (waiter.abandoned) return // disconnect() settled it and owns any claim
+        if (msg) {
+          waiter.claimed = null
+          this.#settleDequeueWaiter(waiter, msg)
+        } else if (waiter.timedOut) {
+          this.#settleDequeueWaiter(waiter, null)
+        } else if (waiter.renotify) {
+          this.#attemptDequeue(waiter, false)
+        }
+      },
+      err => {
+        waiter.inflight = false
+        if (waiter.abandoned) return
+        if (first) {
+          // Surface errors from the initial attempt (not connected, forked
+          // process, ...) to the caller, as a plain failed dequeue would.
+          clearTimeout(waiter.timeoutId)
+          this.#removeDequeueWaiter(waiter)
+          waiter.reject(err)
+          return
+        }
+        this.#logger.error({ err }, 'SQLiteStorage: dequeue waiter failed; will retry')
+        if (waiter.timedOut) this.#settleDequeueWaiter(waiter, null)
+      }
+    )
+  }
+
+  #settleDequeueWaiter (waiter: DequeueWaiter, value: Buffer | null): void {
+    clearTimeout(waiter.timeoutId)
+    this.#removeDequeueWaiter(waiter)
+    waiter.resolve(value)
   }
 
   #removeDequeueWaiter (waiter: DequeueWaiter): void {
@@ -918,15 +1004,20 @@ export class SQLiteStorage implements Storage {
 
   async dequeue (workerId: string, timeout: number): Promise<Buffer | null> {
     this.#assertConnected()
-    const immediate = await this.#tryDequeue(workerId)
-    if (immediate) return immediate
 
-    return new Promise<Buffer | null>(resolve => {
+    // The waiter is registered before the first attempt, not after it comes
+    // back empty: a job announced from another instance in between would
+    // otherwise find no one to wake and sit in the queue until the timeout.
+    return new Promise<Buffer | null>((resolve, reject) => {
       const waiter: DequeueWaiter = {
         workerId,
         resolve,
+        reject,
         inflight: false,
         timedOut: false,
+        renotify: false,
+        abandoned: false,
+        claimed: null,
         timeoutId: setTimeout(() => {
           if (waiter.inflight) {
             // An attempt may already have claimed a message for this waiter;
@@ -934,17 +1025,18 @@ export class SQLiteStorage implements Storage {
             waiter.timedOut = true
             return
           }
-          this.#removeDequeueWaiter(waiter)
-          resolve(null)
+          this.#settleDequeueWaiter(waiter, null)
         }, timeout * 1000)
       }
       this.#dequeueWaiters.push(waiter)
+      this.#attemptDequeue(waiter, true)
     })
   }
 
-  async #tryDequeue (workerId: string): Promise<Buffer | null> {
+  async #tryDequeue (waiter: DequeueWaiter): Promise<Buffer | null> {
     const db = this.#assertConnected()
     return this.#runWrite(() => {
+      if (waiter.abandoned) return null
       db.exec('BEGIN IMMEDIATE')
       try {
         const row = this.#stmt(
@@ -960,11 +1052,12 @@ export class SQLiteStorage implements Storage {
 
         const message = toBuffer(row.message)
         this.#stmt(`INSERT INTO "${this.#processingTable}" (worker_id, job_id, message) VALUES (?, ?, ?)`).run(
-          workerId,
+          waiter.workerId,
           row.job_id!,
           message
         )
         db.exec('COMMIT')
+        waiter.claimed = { jobId: row.job_id!, message }
         return message
       } catch (err) {
         this.#safeRollback(db)

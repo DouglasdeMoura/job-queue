@@ -658,6 +658,26 @@ describe('SQLiteStorage', () => {
       }
     })
 
+    it('should wake a consumer whose first dequeue attempt is still running', async () => {
+      // No pause between dequeue() and enqueue(): the job is announced while
+      // the consumer's initial attempt is in flight, before it could park.
+      const producer = storage.createNamespace('emails')
+      const consumer = storage.createNamespace('emails')
+      await producer.connect()
+      await consumer.connect()
+      try {
+        const start = Date.now()
+        const parked = consumer.dequeue('worker-1', 3)
+        await producer.enqueue('job-1', Buffer.from('racing'), Date.now())
+
+        assert.deepStrictEqual(await parked, Buffer.from('racing'))
+        assert.ok(Date.now() - start < 1000, `woken after ${Date.now() - start}ms, expected well under the 3s timeout`)
+      } finally {
+        await producer.disconnect()
+        await consumer.disconnect()
+      }
+    })
+
     it('should not hand a job to a consumer of a different namespace', async () => {
       const emails = storage.createNamespace('emails')
       const images = storage.createNamespace('images')
@@ -775,6 +795,91 @@ describe('SQLiteStorage', () => {
         assert.deepStrictEqual(await sibling.dequeue('w1', 1), Buffer.from('sibling'))
       } finally {
         await sibling.disconnect()
+      }
+    })
+
+    it('should never strand a claimed job in processing when a consumer disconnects', async () => {
+      // A dequeue attempt can claim a job (moving it to processing) just
+      // before disconnect() settles the waiter. The job must then either reach
+      // the caller or go back to the queue — a processing row under a
+      // stopping, unregistered worker is never recovered by the reaper.
+      // Disconnecting at different microtask offsets covers both outcomes.
+      for (let offset = 0; offset < 8; offset++) {
+        const producer = storage.createNamespace(`strand${offset}`)
+        const consumer = storage.createNamespace(`strand${offset}`)
+        await producer.connect()
+        await consumer.connect()
+        try {
+          const parked = consumer.dequeue('worker-1', 5)
+          await sleep(10)
+          await producer.enqueue('job-1', Buffer.from('claimed'), Date.now())
+          for (let i = 0; i < offset; i++) await Promise.resolve()
+          await consumer.disconnect()
+
+          const delivered = await parked
+          const inProcessing = await producer.getProcessingJobs('worker-1')
+          if (delivered) {
+            assert.deepStrictEqual(delivered, Buffer.from('claimed'), `offset ${offset}`)
+            assert.strictEqual(inProcessing.length, 1, `offset ${offset}: the caller holds it`)
+          } else {
+            assert.deepStrictEqual(inProcessing, [], `offset ${offset}: stranded in processing`)
+            assert.deepStrictEqual(await producer.dequeue('worker-2', 1), Buffer.from('claimed'), `offset ${offset}`)
+          }
+        } finally {
+          await consumer.disconnect()
+          await producer.disconnect()
+        }
+      }
+    })
+
+    it('should keep a namespace usable when it attaches while the root is closing', async () => {
+      const root = new SQLiteStorage()
+      await root.connect()
+      const ns = root.createNamespace('late')
+      const closing = root.disconnect()
+      await ns.connect() // attaches while the close waits for the write lock
+      await closing
+
+      try {
+        await ns.enqueue('job-1', Buffer.from('x'), Date.now())
+        assert.deepStrictEqual(await ns.dequeue('worker-1', 1), Buffer.from('x'))
+      } finally {
+        await ns.disconnect() // last one out finishes the root's close
+      }
+      await assert.rejects(root.enqueue('job-2', Buffer.from('x'), Date.now()), /not connected/)
+    })
+
+    it('should honour connect() called while the root is still closing', async () => {
+      const root = new SQLiteStorage()
+      await root.connect()
+      const closing = root.disconnect()
+      const reopening = root.connect()
+      await closing
+      await reopening
+      try {
+        await root.enqueue('job-1', Buffer.from('x'), Date.now())
+        assert.deepStrictEqual(await root.dequeue('worker-1', 1), Buffer.from('x'))
+        // Its timers run again: it holds cleanup leadership.
+        await sleep(50)
+        assert.strictEqual(await root.acquireLeaderLock('cleanup-leader', 'intruder', 1000), false)
+      } finally {
+        await root.disconnect()
+      }
+    })
+
+    it('should honour disconnect() called while a namespace connect() is in flight', async () => {
+      for (const rootConnected of [true, false]) {
+        const root = new SQLiteStorage()
+        if (rootConnected) await root.connect()
+        const ns = root.createNamespace('pending')
+        const connecting = ns.connect()
+        await ns.disconnect()
+        await connecting
+
+        await assert.rejects(ns.getWorkers(), /not connected/, `root connected: ${rootConnected}`)
+        // No leftover refCount: the root closes for real.
+        await root.disconnect()
+        await assert.rejects(root.getWorkers(), /not connected/, `root connected: ${rootConnected}`)
       }
     })
 
