@@ -1,10 +1,14 @@
 import assert from 'node:assert'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { once } from 'node:events'
+import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { Queue } from '../src/queue.ts'
+import type { Job } from '../src/types.ts'
 import { SQLiteStorage } from '../src/storage/sqlite.ts'
 import { StorageError } from '../src/errors.ts'
 import { createSQLiteStorage } from './fixtures/sqlite.ts'
@@ -605,6 +609,147 @@ describe('SQLiteStorage', () => {
     })
   })
 
+  describe('wake-ups across instances of the same namespace', () => {
+    // Queue calls createNamespace(name) itself, so a producer Queue and a
+    // consumer Queue with the same name hold two different storage instances.
+    // A consumer parked in dequeue() must still be woken by the other one's
+    // enqueue instead of sitting out its whole blockTimeout.
+
+    it('should wake a consumer parked on another instance when a job is enqueued', async () => {
+      const producer = storage.createNamespace('emails')
+      const consumer = storage.createNamespace('emails')
+      await producer.connect()
+      await consumer.connect()
+      try {
+        const start = Date.now()
+        const parked = consumer.dequeue('worker-1', 5)
+        await sleep(20)
+        const msg = Buffer.from('cross-instance')
+        await producer.enqueue('job-1', msg, Date.now())
+
+        assert.deepStrictEqual(await parked, msg)
+        assert.ok(Date.now() - start < 1000, `woken after ${Date.now() - start}ms, expected well under the 5s timeout`)
+      } finally {
+        await producer.disconnect()
+        await consumer.disconnect()
+      }
+    })
+
+    it('should wake a consumer parked on another instance when a job is retried', async () => {
+      const a = storage.createNamespace('emails')
+      const b = storage.createNamespace('emails')
+      await a.connect()
+      await b.connect()
+      try {
+        await a.enqueue('job-1', Buffer.from('attempt-0'), Date.now())
+        assert.ok(await a.dequeue('worker-a', 1))
+
+        const start = Date.now()
+        const parked = b.dequeue('worker-b', 5)
+        await sleep(20)
+        await a.retryJob('job-1', Buffer.from('attempt-1'), 'worker-a', 1)
+
+        assert.deepStrictEqual(await parked, Buffer.from('attempt-1'))
+        assert.ok(Date.now() - start < 1000, `woken after ${Date.now() - start}ms`)
+      } finally {
+        await a.disconnect()
+        await b.disconnect()
+      }
+    })
+
+    it('should not hand a job to a consumer of a different namespace', async () => {
+      const emails = storage.createNamespace('emails')
+      const images = storage.createNamespace('images')
+      await emails.connect()
+      await images.connect()
+      try {
+        const parked = images.dequeue('worker-1', 0.3)
+        await sleep(20)
+        await emails.enqueue('job-1', Buffer.from('email'), Date.now())
+
+        assert.strictEqual(await parked, null)
+        assert.deepStrictEqual(await emails.dequeue('worker-2', 1), Buffer.from('email'))
+      } finally {
+        await emails.disconnect()
+        await images.disconnect()
+      }
+    })
+
+    it('should resolve enqueueAndWait promptly with separate producer and consumer Queues', async () => {
+      const producer = new Queue<{ n: number }, { doubled: number }>({ storage, name: 'math' })
+      const consumer = new Queue<{ n: number }, { doubled: number }>({ storage, name: 'math', blockTimeout: 10 })
+      consumer.execute(async (job: Job<{ n: number }>) => ({ doubled: job.payload.n * 2 }))
+      await consumer.start()
+      await producer.start()
+      try {
+        // Let the consumer park in dequeue() before the job exists.
+        await sleep(50)
+        const start = Date.now()
+        const result = await producer.enqueueAndWait('job-1', { n: 21 }, { timeout: 5000 })
+
+        assert.deepStrictEqual(result, { doubled: 42 })
+        assert.ok(Date.now() - start < 2000, `took ${Date.now() - start}ms; the consumer was not woken`)
+      } finally {
+        await producer.stop()
+        await consumer.stop()
+      }
+    })
+  })
+
+  describe('retryJob matches the in-flight row by job id', () => {
+    // retryJob receives the NEW payload (attempts incremented), so it has to
+    // find the old in-flight row some other way than comparing bytes. It must
+    // work for any payload serde, not only JSON.
+    const binary = (tag: number, attempts: number) => Buffer.from([0x82, tag, 0x00, attempts, 0xff])
+
+    it('should remove only the retried job with non-JSON payloads', async () => {
+      await storage.enqueue('job-a', binary(1, 0), Date.now())
+      await storage.enqueue('job-b', binary(2, 0), Date.now())
+      await storage.dequeue('worker-1', 1)
+      await storage.dequeue('worker-1', 1)
+
+      await storage.retryJob('job-a', binary(1, 1), 'worker-1', 1)
+
+      // A stale row for job-a would be requeued by the reaper if this worker
+      // crashed, running the job a second time.
+      assert.deepStrictEqual(await storage.getProcessingJobs('worker-1'), [binary(2, 0)])
+      assert.deepStrictEqual(await storage.dequeue('worker-2', 1), binary(1, 1))
+    })
+
+    it('should keep tracking the job id through requeue and a second retry', async () => {
+      await storage.enqueue('job-a', binary(1, 0), Date.now())
+      const first = await storage.dequeue('worker-1', 1)
+      await storage.requeue('job-a', first!, 'worker-1')
+
+      await storage.dequeue('worker-1', 1)
+      await storage.retryJob('job-a', binary(1, 1), 'worker-1', 1)
+      await storage.dequeue('worker-1', 1)
+      await storage.retryJob('job-a', binary(1, 2), 'worker-1', 2)
+
+      assert.deepStrictEqual(await storage.getProcessingJobs('worker-1'), [])
+      assert.deepStrictEqual(await storage.dequeue('worker-1', 1), binary(1, 2))
+      assert.match((await storage.getJobState('job-a'))!, /^failing:\d+:2$/)
+    })
+  })
+
+  describe('expiry boundary', () => {
+    // Jobs, results and errors all treat expires_at as the first instant the
+    // row is gone.
+    it('should expire results and errors exactly at expires_at', async t => {
+      t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
+      await storage.setResult('job-1', Buffer.from('result'), 100)
+      await storage.setError('job-2', Buffer.from('error'), 100)
+
+      t.mock.timers.setTime(1_000_099)
+      assert.deepStrictEqual(await storage.getResult('job-1'), Buffer.from('result'))
+      assert.deepStrictEqual(await storage.getError('job-2'), Buffer.from('error'))
+
+      t.mock.timers.setTime(1_000_100)
+      assert.strictEqual(await storage.getResult('job-1'), null)
+      assert.strictEqual(await storage.getError('job-2'), null)
+    })
+  })
+
   describe('namespace lifecycle (adversarial)', () => {
     it('should be idempotent on double disconnect', async () => {
       const ns = storage.createNamespace('ns-double') as SQLiteStorage
@@ -706,5 +851,188 @@ describe('SQLiteStorage (file-backed)', () => {
 
     const reopen = new SQLiteStorage({ path })
     await assert.rejects(reopen.connect(), StorageError)
+  })
+
+  describe('single owner per database file', () => {
+    // Notifications and dequeue wake-ups are in-process, so a second
+    // connection to the same file would silently miss them (enqueueAndWait
+    // hanging until its timeout). The second connection must be refused.
+
+    // Refusal tests must not leak a storage (and its timers) when the
+    // assertion they exist for fails and the connect unexpectedly succeeds.
+    const extra: SQLiteStorage[] = []
+    function track (s: SQLiteStorage): SQLiteStorage {
+      extra.push(s)
+      return s
+    }
+    afterEach(async () => {
+      for (const s of extra.splice(0)) await s.disconnect()
+    })
+
+    function writeOwnerClaim (path: string, owner: { pid: number; instanceId: string; heartbeatAt: number }): void {
+      const raw = new DatabaseSync(path)
+      try {
+        raw
+          .prepare(
+            'INSERT INTO "jq_meta" (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+          )
+          .run('owner', JSON.stringify(owner))
+      } finally {
+        raw.close()
+      }
+    }
+
+    async function createTables (path: string): Promise<void> {
+      const s = track(new SQLiteStorage({ path }))
+      await s.connect()
+      await s.disconnect()
+    }
+
+    it('should refuse a second storage on the same file in the same process', async () => {
+      const second = track(new SQLiteStorage({ path: join(dir, 'q.sqlite') }))
+      await assert.rejects(second.connect(), (err: Error) => {
+        assert.ok(err instanceof StorageError)
+        assert.match(err.message, new RegExp(`already in use by another SQLiteStorage \\(pid=${process.pid}\\)`))
+        return true
+      })
+
+      // The owner keeps working.
+      await storage.enqueue('j1', Buffer.from('x'), Date.now())
+      assert.deepStrictEqual(await storage.dequeue('w1', 1), Buffer.from('x'))
+
+      // Once the owner disconnects, the file is free again.
+      await storage.disconnect()
+      await second.connect()
+      await second.disconnect()
+    })
+
+    it('should not leave a half-open handle behind after a refused connect', async () => {
+      const second = track(new SQLiteStorage({ path: join(dir, 'q.sqlite') }))
+      await assert.rejects(second.connect(), StorageError)
+      // A leaked handle would make this connect() return early as "connected".
+      await assert.rejects(second.connect(), StorageError)
+      await assert.rejects(second.enqueue('j1', Buffer.from('x'), Date.now()), /not connected/)
+    })
+
+    it('should allow a different tablePrefix on the same file', async () => {
+      const other = track(new SQLiteStorage({ path: join(dir, 'q.sqlite'), tablePrefix: 'other_' }))
+      await other.connect()
+      try {
+        await other.enqueue('j1', Buffer.from('other'), Date.now())
+        assert.strictEqual(await storage.dequeue('w1', 0.1), null)
+        assert.deepStrictEqual(await other.dequeue('w1', 1), Buffer.from('other'))
+      } finally {
+        await other.disconnect()
+      }
+    })
+
+    it('should refuse while another process holds the file, and take over once it dies', async () => {
+      const path = join(dir, 'shared.sqlite')
+      const moduleUrl = new URL('../src/storage/sqlite.ts', import.meta.url).href
+      const child = spawn(
+        process.execPath,
+        [
+          '--no-warnings',
+          '--input-type=module',
+          '-e',
+          `import { SQLiteStorage } from ${JSON.stringify(moduleUrl)}
+           const s = new SQLiteStorage({ path: process.argv[1] })
+           await s.connect()
+           process.stdout.write('ready')
+           process.stdin.resume()`,
+          path
+        ],
+        { stdio: ['pipe', 'pipe', 'inherit'] }
+      )
+      const exited = once(child, 'exit')
+      try {
+        const [chunk] = await once(child.stdout, 'data')
+        assert.strictEqual(String(chunk), 'ready')
+
+        const s = track(new SQLiteStorage({ path }))
+        await assert.rejects(s.connect(), new RegExp(`pid=${child.pid}`))
+
+        // A crash leaves the claim behind; a dead pid must not block restarts.
+        child.kill('SIGKILL')
+        await exited
+        await s.connect()
+        await s.disconnect()
+      } finally {
+        child.kill('SIGKILL')
+        await exited
+      }
+    })
+
+    it('should take over a claim whose heartbeat is stale even if the pid is alive', async () => {
+      // pid reuse: the recorded pid now belongs to an unrelated live process.
+      const path = join(dir, 'stale.sqlite')
+      await createTables(path)
+      writeOwnerClaim(path, { pid: process.ppid, instanceId: 'gone', heartbeatAt: Date.now() - 60_000 })
+
+      const s = track(new SQLiteStorage({ path }))
+      await s.connect()
+      await s.disconnect()
+    })
+
+    it('should take over a fresh claim left by this pid from a previous run', async () => {
+      // e.g. pid 1 in a container that was restarted within the stale window.
+      const path = join(dir, 'restart.sqlite')
+      await createTables(path)
+      writeOwnerClaim(path, { pid: process.pid, instanceId: 'previous-run', heartbeatAt: Date.now() })
+
+      const s = track(new SQLiteStorage({ path }))
+      await s.connect()
+      await s.disconnect()
+    })
+
+    it('should refuse a fresh claim held by another live process', async () => {
+      const path = join(dir, 'live.sqlite')
+      await createTables(path)
+      writeOwnerClaim(path, { pid: process.ppid, instanceId: 'other', heartbeatAt: Date.now() })
+
+      const s = track(new SQLiteStorage({ path }))
+      await assert.rejects(s.connect(), new RegExp(`pid=${process.ppid}`))
+    })
+  })
+
+  describe('incremental vacuum', () => {
+    function pragma (path: string, name: string): number {
+      const raw = new DatabaseSync(path)
+      try {
+        return Object.values(raw.prepare(`PRAGMA ${name}`).get()!)[0] as number
+      } finally {
+        raw.close()
+      }
+    }
+
+    it('should create new databases with auto_vacuum = INCREMENTAL', () => {
+      assert.strictEqual(pragma(join(dir, 'q.sqlite'), 'auto_vacuum'), 2)
+    })
+
+    it('should return pages freed by deleted rows to the OS', async () => {
+      const path = join(dir, 'vacuum.sqlite')
+      const s = new SQLiteStorage({ path, cleanupIntervalMs: false, vacuum: { enabled: true, intervalMs: 50 } })
+      await s.connect()
+      try {
+        const blob = Buffer.alloc(64 * 1024, 7)
+        for (let i = 0; i < 100; i++) await s.setResult(`job-${i}`, blob, 1)
+        const peak = pragma(path, 'page_count')
+        assert.ok(peak > 1000, `expected ~6MB of pages, got ${peak}`)
+
+        await sleep(5)
+        // Reading an expired result deletes it, leaving its pages on the freelist.
+        for (let i = 0; i < 100; i++) assert.strictEqual(await s.getResult(`job-${i}`), null)
+
+        let pages = peak
+        for (let i = 0; i < 40 && (pages > peak / 10 || pragma(path, 'freelist_count') > 0); i++) {
+          await sleep(50)
+          pages = pragma(path, 'page_count')
+        }
+        assert.strictEqual(pragma(path, 'freelist_count'), 0)
+        assert.ok(pages < peak / 10, `page_count ${pages} did not shrink from ${peak}`)
+      } finally {
+        await s.disconnect()
+      }
+    })
   })
 })

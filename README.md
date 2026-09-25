@@ -270,7 +270,7 @@ queue.on('error', (error) => {
 | `SQLiteStorage` | yes (SQLite WAL) | **no** (single-process only) | no | none | embedded, persistent, transactional, queryable, single Node process |
 | `RedisStorage` | yes (AOF/RDB) | yes | yes | Redis / Valkey | high-throughput production |
 
-Cross-process job queues require `RedisStorage`. `SQLiteStorage` is **explicitly single-process** — it asserts `process.pid` on every call and throws if you fork after `connect()`.
+Cross-process job queues require `RedisStorage`. `SQLiteStorage` is **explicitly single-process**: `connect()` throws if another live `SQLiteStorage` already has the same database file (and table prefix) open.
 
 #### MemoryStorage
 
@@ -343,7 +343,7 @@ new SQLiteStorage({
   path: ':memory:',                // default — explicit path required for persistence
   tablePrefix: 'jq_',
   cleanupIntervalMs: 30_000,       // or false to disable background cleanup
-  vacuum: { enabled: true, intervalMs: 24 * 60 * 60 * 1000 }, // or false
+  vacuum: { enabled: true, intervalMs: 24 * 60 * 60 * 1000 }, // PRAGMA optimize + incremental_vacuum, or false
   pragmas: { busy_timeout: 100 },  // override defaults; merged with WAL/synchronous/etc.
   logger                           // pino-compatible
 })
@@ -355,10 +355,10 @@ Features:
 - In-process write mutex prevents event-loop stalls under contention
 - `node:sqlite` returns `Uint8Array` for BLOBs; `SQLiteStorage` normalizes everything to `Buffer`
 - Leader-elected background cleanup of expired results, errors, workers, locks
-- Periodic `PRAGMA optimize` to keep query plans current
+- Periodic `PRAGMA optimize` plus `PRAGMA incremental_vacuum` (new databases use `auto_vacuum = INCREMENTAL`), which returns space freed by cleanup to the OS without rewriting the whole file
 - Schema version stored in `<prefix>meta`; refuses to start on future-version drift
 
-**Single-process only.** On every call `SQLiteStorage` asserts that `process.pid` matches the pid at `connect()` and throws otherwise. If you fork your worker pool after `connect()`, each child must call `connect()` itself. For genuine multi-process queues use `PgStorage`.
+**Single-process only.** Job notifications (`enqueueAndWait`, events) and dequeue wake-ups are in-process, so they never reach a second connection to the same file. Rather than degrade silently, a file-backed `SQLiteStorage` records itself as the owner of its database and `connect()` throws if another live instance — in this process or another one — already owns it. A claim left behind by a crashed process is taken over as soon as its pid is gone (or its heartbeat is older than 15 s). Within one process, share a single `SQLiteStorage` and use named queues (`createNamespace()`) to separate workloads; for producers and workers in separate processes, use `RedisStorage` or `PgStorage`.
 
 **Filesystem requirements.** WAL mode requires a local filesystem that supports POSIX advisory locking. NFS, SMB, and some container bind-mounts do not — `SQLiteStorage` will log a warning if WAL mode is requested but not active.
 

@@ -29,6 +29,11 @@ const DEFAULT_MMAP_SIZE_BYTES = 128 * 1024 * 1024
 const DEFAULT_CACHE_SIZE_PAGES = 2000
 
 const DEFAULT_PRAGMAS: Record<string, string | number> = {
+  // Must be set before the first table is created, so it comes first. Lets the
+  // maintenance loop hand freed pages back to the OS with incremental_vacuum,
+  // which only touches the freelist, instead of a full VACUUM that rewrites
+  // the whole file and blocks the event loop for as long as that takes.
+  auto_vacuum: 'INCREMENTAL',
   journal_mode: 'WAL',
   synchronous: 'NORMAL',
   busy_timeout: DEFAULT_BUSY_TIMEOUT_MS,
@@ -41,6 +46,18 @@ const DEFAULT_PRAGMAS: Record<string, string | number> = {
 // Chunk size for IN-list queries; well under SQLITE_MAX_VARIABLE_NUMBER
 // (32766 by default) so bulk calls never hit the bound-parameter limit.
 const MAX_BIND_PARAMS_PER_QUERY = 500
+
+// A file-backed database is owned by one live SQLiteStorage root at a time.
+// The owner refreshes its heartbeat in <prefix>meta; a claim older than
+// OWNER_STALE_MS is treated as abandoned even if its pid has been reused.
+const OWNER_META_KEY = 'owner'
+const OWNER_HEARTBEAT_MS = 5_000
+const OWNER_STALE_MS = 15_000
+
+// Instance ids of roots in this process that currently own a database. Lets a
+// claim left behind by this same pid (e.g. pid 1 after a container restart) be
+// told apart from a sibling instance that is still connected.
+const liveOwnerInstances = new Set<string>()
 
 const WRITE_RETRY_BASE_MS = 5
 const WRITE_RETRY_MAX_MS = 50
@@ -84,7 +101,8 @@ interface SQLiteStorageConfig {
   cleanupIntervalMs?: number | false
 
   /**
-   * Periodic VACUUM / pragma optimize cadence.
+   * Periodic maintenance cadence: `PRAGMA optimize` plus `PRAGMA incremental_vacuum`,
+   * which returns pages freed by cleanup to the OS without rewriting the file.
    * Pass false to disable.
    * Default: { enabled: true, intervalMs: 24 * 60 * 60 * 1000 }.
    */
@@ -109,6 +127,16 @@ function toBuffer (value: unknown): Buffer {
   }
   if (typeof value === 'string') return Buffer.from(value)
   throw new StorageError(`SQLiteStorage: expected Buffer/Uint8Array, got ${typeof value}`)
+}
+
+function isProcessAlive (pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    // EPERM: the process exists but belongs to another user.
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
 }
 
 function sleep (ms: number): Promise<void> {
@@ -171,6 +199,7 @@ export class SQLiteStorage implements Storage {
   #cleanupInterval: ReturnType<typeof setInterval> | null = null
   #leadershipTimer: ReturnType<typeof setInterval> | null = null
   #vacuumInterval: ReturnType<typeof setInterval> | null = null
+  #ownerHeartbeat: ReturnType<typeof setInterval> | null = null
   #writeMutex: Promise<void> = Promise.resolve()
   #connectPromise: Promise<void> | null = null
 
@@ -261,6 +290,7 @@ export class SQLiteStorage implements Storage {
       this.#checkSchemaVersion()
       // Register with parent so the cleanup leader sweeps our tables too.
       this.#parentStorage.#childPrefixes.add(this.#tablePrefix)
+      this.#subscribeToNewJobs()
       return
     }
 
@@ -274,10 +304,28 @@ export class SQLiteStorage implements Storage {
     }
     this.#connectedPid = process.pid
 
-    this.#applyPragmas()
-    this.#assertWalActive()
-    this.#createSchema()
-    this.#checkSchemaVersion()
+    try {
+      this.#applyPragmas()
+      this.#assertWalActive()
+      this.#createSchema()
+      this.#checkSchemaVersion()
+      this.#claimOwnership()
+    } catch (err) {
+      // Don't leave a half-open handle behind: a later connect() would see
+      // #db set and return early as if it had succeeded.
+      this.#stmts.clear()
+      try {
+        this.#db.close()
+      } catch {
+        // best-effort
+      }
+      this.#db = null
+      this.#connectedPid = null
+      throw err
+    }
+
+    this.#subscribeToNewJobs()
+    this.#startOwnerHeartbeat()
     this.#startCleanupLeaderLoop()
     this.#startVacuumLoop()
   }
@@ -299,6 +347,10 @@ export class SQLiteStorage implements Storage {
       if (this.#vacuumInterval) {
         clearInterval(this.#vacuumInterval)
         this.#vacuumInterval = null
+      }
+      if (this.#ownerHeartbeat) {
+        clearInterval(this.#ownerHeartbeat)
+        this.#ownerHeartbeat = null
       }
       this.#db = null
       this.#connectedPid = null
@@ -367,6 +419,13 @@ export class SQLiteStorage implements Storage {
       this.#removeSubscriptions()
       this.#eventEmitter.removeAllListeners()
       this.#notifyEmitter.removeAllListeners()
+      // The heartbeat runs until the handle actually closes: children still
+      // using it during a deferred close need the claim to stay fresh.
+      if (this.#ownerHeartbeat) {
+        clearInterval(this.#ownerHeartbeat)
+        this.#ownerHeartbeat = null
+      }
+      this.#releaseOwnership()
       this.#stmts.clear()
 
       if (this.#db) {
@@ -389,7 +448,13 @@ export class SQLiteStorage implements Storage {
   // object — trusted at the same level as tablePrefix and path.
   #applyPragmas (): void {
     const db = this.#db!
-    for (const [key, value] of Object.entries(this.#pragmas)) {
+    // busy_timeout goes first: journal_mode and auto_vacuum need a lock, and
+    // without a timeout they fail instantly with SQLITE_BUSY whenever another
+    // connection happens to be writing.
+    const entries = Object.entries(this.#pragmas).sort(
+      ([a], [b]) => Number(b === 'busy_timeout') - Number(a === 'busy_timeout')
+    )
+    for (const [key, value] of entries) {
       const formattedValue = typeof value === 'string' ? value : String(value)
       db.exec(`PRAGMA ${key} = ${formattedValue}`)
     }
@@ -419,11 +484,13 @@ export class SQLiteStorage implements Storage {
       );
       CREATE TABLE IF NOT EXISTS "${this.#queueTable}" (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
         message BLOB NOT NULL
       );
       CREATE TABLE IF NOT EXISTS "${this.#processingTable}" (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         worker_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
         message BLOB NOT NULL
       );
       CREATE INDEX IF NOT EXISTS "${this.#processingTable}_worker_idx"
@@ -479,6 +546,98 @@ export class SQLiteStorage implements Storage {
         `SQLiteStorage: database schema version ${echoed} is not supported ` +
           `by this library (supports schema v${SCHEMA_VERSION}). Downgrade is not supported.`
       )
+    }
+  }
+
+  // Node's cluster and child_process start fresh processes, so a second
+  // process never inherits this instance — it opens its own connection to the
+  // same file. Storage stays consistent, but dequeue wake-ups and job
+  // notifications are in-process EventEmitters and would never reach it:
+  // enqueueAndWait would hang until its timeout. Refuse the second connection
+  // instead of degrading silently. Separate table prefixes are separate
+  // queues, so ownership is per prefix.
+  #claimOwnership (): void {
+    if (this.#path === ':memory:' || this.#path === '') return // private to this connection
+
+    const db = this.#db!
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.#stmt(`SELECT value FROM "${this.#metaTable}" WHERE key = ?`).get(OWNER_META_KEY) as
+        | { value?: string }
+        | undefined
+      const owner = row?.value ? this.#parseOwner(row.value) : null
+
+      if (owner && owner.instanceId !== this.#instanceId && this.#isOwnerLive(owner)) {
+        throw new StorageError(
+          `SQLiteStorage: '${this.#path}' (tablePrefix '${this.#tablePrefix}') is already in use by ` +
+            `another SQLiteStorage (pid=${owner.pid}). SQLiteStorage is single-process: job notifications ` +
+            'and dequeue wake-ups do not cross connections. Share one SQLiteStorage instance (use ' +
+            'createNamespace() for separate queues), or use RedisStorage/PgStorage for multiple processes.'
+        )
+      }
+
+      this.#stmt(
+        `INSERT INTO "${this.#metaTable}" (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      ).run(OWNER_META_KEY, this.#ownerValue())
+      db.exec('COMMIT')
+    } catch (err) {
+      this.#safeRollback()
+      throw err
+    }
+    liveOwnerInstances.add(this.#instanceId)
+  }
+
+  #isOwnerLive (owner: { pid: number; instanceId: string; heartbeatAt: number }): boolean {
+    if (Date.now() - owner.heartbeatAt >= OWNER_STALE_MS) return false
+    if (owner.pid === process.pid) return liveOwnerInstances.has(owner.instanceId)
+    return isProcessAlive(owner.pid)
+  }
+
+  #parseOwner (value: string): { pid: number; instanceId: string; heartbeatAt: number } | null {
+    try {
+      const parsed = JSON.parse(value) as { pid?: unknown; instanceId?: unknown; heartbeatAt?: unknown }
+      if (
+        typeof parsed.pid === 'number' &&
+        typeof parsed.instanceId === 'string' &&
+        typeof parsed.heartbeatAt === 'number'
+      ) {
+        return { pid: parsed.pid, instanceId: parsed.instanceId, heartbeatAt: parsed.heartbeatAt }
+      }
+    } catch {
+      // unreadable claim; treat as absent
+    }
+    return null
+  }
+
+  #ownerValue (): string {
+    return JSON.stringify({ pid: process.pid, instanceId: this.#instanceId, heartbeatAt: Date.now() })
+  }
+
+  #startOwnerHeartbeat (): void {
+    if (!liveOwnerInstances.has(this.#instanceId)) return // nothing claimed (:memory:)
+    this.#ownerHeartbeat = setInterval(() => {
+      this.#runWrite(() => {
+        if (!this.#db) return
+        this.#stmt(
+          `UPDATE "${this.#metaTable}" SET value = ? WHERE key = ? AND json_extract(value, '$.instanceId') = ?`
+        ).run(this.#ownerValue(), OWNER_META_KEY, this.#instanceId)
+      }).catch(err => {
+        this.#logger.warn({ err }, 'SQLiteStorage: owner heartbeat failed')
+      })
+    }, OWNER_HEARTBEAT_MS)
+  }
+
+  #releaseOwnership (): void {
+    if (!liveOwnerInstances.delete(this.#instanceId)) return
+    try {
+      this.#stmt(`DELETE FROM "${this.#metaTable}" WHERE key = ? AND json_extract(value, '$.instanceId') = ?`).run(
+        OWNER_META_KEY,
+        this.#instanceId
+      )
+    } catch (err) {
+      // best-effort: a stale claim expires after OWNER_STALE_MS anyway
+      this.#logger.debug({ err }, 'SQLiteStorage: failed to release database ownership')
     }
   }
 
@@ -590,6 +749,22 @@ export class SQLiteStorage implements Storage {
     this.#dequeueWaiters = []
   }
 
+  // Dequeue wake-ups go through the root's emitter on a prefix-scoped channel,
+  // so a job enqueued through one namespace instance wakes consumers parked on
+  // any other instance of the same name (e.g. separate producer and consumer
+  // Queues), as Pg's LISTEN new_job and Redis' BLMOVE do.
+  #newJobChannel (): string {
+    return `newjob:${this.#tablePrefix}`
+  }
+
+  #subscribeToNewJobs (): void {
+    this.#subscribe(this.#events(), this.#newJobChannel(), () => this.#notifyDequeueWaiters())
+  }
+
+  #announceNewJob (): void {
+    this.#events().emit(this.#newJobChannel())
+  }
+
   #notifyDequeueWaiters (): void {
     // Try to hand each parked waiter a message. Each attempt is its own write
     // tx. Waiters stay in #dequeueWaiters until their promise settles: removing
@@ -667,7 +842,7 @@ export class SQLiteStorage implements Storage {
         }
 
         this.#stmt(`INSERT INTO "${this.#jobsTable}" (id, state) VALUES (?, ?)`).run(id, state)
-        this.#stmt(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
+        this.#stmt(`INSERT INTO "${this.#queueTable}" (job_id, message) VALUES (?, ?)`).run(id, message)
         db.exec('COMMIT')
         return null
       } catch (err) {
@@ -678,7 +853,7 @@ export class SQLiteStorage implements Storage {
 
     if (existing === null) {
       this.#events().emit(this.#eventChannel(), id, 'queued')
-      this.#notifyDequeueWaiters()
+      this.#announceNewJob()
     }
 
     return existing
@@ -718,8 +893,8 @@ export class SQLiteStorage implements Storage {
         const row = this.#stmt(
           `DELETE FROM "${this.#queueTable}"
              WHERE seq = (SELECT seq FROM "${this.#queueTable}" ORDER BY seq LIMIT 1)
-             RETURNING message`
-        ).get() as { message?: unknown } | undefined
+             RETURNING job_id, message`
+        ).get() as { job_id?: string; message?: unknown } | undefined
 
         if (!row || row.message === undefined) {
           db.exec('COMMIT')
@@ -727,7 +902,11 @@ export class SQLiteStorage implements Storage {
         }
 
         const message = toBuffer(row.message)
-        this.#stmt(`INSERT INTO "${this.#processingTable}" (worker_id, message) VALUES (?, ?)`).run(workerId, message)
+        this.#stmt(`INSERT INTO "${this.#processingTable}" (worker_id, job_id, message) VALUES (?, ?, ?)`).run(
+          workerId,
+          row.job_id!,
+          message
+        )
         db.exec('COMMIT')
         return message
       } catch (err) {
@@ -743,14 +922,14 @@ export class SQLiteStorage implements Storage {
       db.exec('BEGIN IMMEDIATE')
       try {
         this.#deleteOneProcessingRow(workerId, message)
-        this.#stmt(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
+        this.#stmt(`INSERT INTO "${this.#queueTable}" (job_id, message) VALUES (?, ?)`).run(id, message)
         db.exec('COMMIT')
       } catch (err) {
         this.#safeRollback()
         throw err
       }
     })
-    this.#notifyDequeueWaiters()
+    this.#announceNewJob()
   }
 
   async ack (id: string, message: Buffer, workerId: string): Promise<void> {
@@ -877,7 +1056,7 @@ export class SQLiteStorage implements Storage {
       | { data?: unknown; expires_at?: number }
       | undefined
     if (!row) return null
-    if (row.expires_at !== undefined && Date.now() > row.expires_at) {
+    if (row.expires_at !== undefined && Date.now() >= row.expires_at) {
       await this.#runWrite(() => {
         this.#stmt(`DELETE FROM "${this.#resultsTable}" WHERE id = ?`).run(id)
       })
@@ -904,7 +1083,7 @@ export class SQLiteStorage implements Storage {
       | { data?: unknown; expires_at?: number }
       | undefined
     if (!row) return null
-    if (row.expires_at !== undefined && Date.now() > row.expires_at) {
+    if (row.expires_at !== undefined && Date.now() >= row.expires_at) {
       await this.#runWrite(() => {
         this.#stmt(`DELETE FROM "${this.#errorsTable}" WHERE id = ?`).run(id)
       })
@@ -1092,35 +1271,19 @@ export class SQLiteStorage implements Storage {
     await this.#runWrite(() => {
       db.exec('BEGIN IMMEDIATE')
       try {
-        // `message` here is the NEW retry payload (with incremented attempts),
-        // not the bytes sitting in processing. Find the in-flight row for this
-        // id by JSON-parsing each of the worker's processing rows. Mirrors
-        // pg.ts. If the app uses a non-JSON serde, no row matches and the stale
-        // row is left for the reaper to recover — slower, but never wipes
-        // sibling in-flight jobs. The scan runs inside the transaction: outside
-        // it, a concurrent write (reaper recovery, unregisterWorker) could
-        // requeue the same row before our DELETE, double-running the job.
-        let oldSeq: number | null = null
-        const rows = this.#stmt(`SELECT seq, message FROM "${this.#processingTable}" WHERE worker_id = ?`).all(
-          workerId
-        ) as Array<{ seq: number; message: unknown }>
-        for (const row of rows) {
-          try {
-            const parsed = JSON.parse(toBuffer(row.message).toString()) as { id?: unknown }
-            if (parsed && parsed.id === id) {
-              oldSeq = row.seq
-              break
-            }
-          } catch {
-            // non-JSON payload; skip
-          }
-        }
-
+        // `message` is the NEW retry payload (attempts incremented), so it
+        // can't be matched byte-for-byte against the in-flight row. Match on
+        // the job id recorded at dequeue time instead — this works for any
+        // payload serde, not just JSON.
         this.#stmt(`UPDATE "${this.#jobsTable}" SET state = ? WHERE id = ?`).run(state, id)
-        if (oldSeq !== null) {
-          this.#stmt(`DELETE FROM "${this.#processingTable}" WHERE seq = ?`).run(oldSeq)
-        }
-        this.#stmt(`INSERT INTO "${this.#queueTable}" (message) VALUES (?)`).run(message)
+        this.#stmt(
+          `DELETE FROM "${this.#processingTable}" WHERE seq = (
+             SELECT seq FROM "${this.#processingTable}"
+              WHERE worker_id = ? AND job_id = ?
+              ORDER BY seq LIMIT 1
+           )`
+        ).run(workerId, id)
+        this.#stmt(`INSERT INTO "${this.#queueTable}" (job_id, message) VALUES (?, ?)`).run(id, message)
         db.exec('COMMIT')
       } catch (err) {
         this.#safeRollback()
@@ -1130,7 +1293,7 @@ export class SQLiteStorage implements Storage {
 
     this.#notifications().emit(this.#notifyChannel(id), 'failing')
     this.#events().emit(this.#eventChannel(), id, 'failing')
-    this.#notifyDequeueWaiters()
+    this.#announceNewJob()
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1281,11 +1444,12 @@ export class SQLiteStorage implements Storage {
         const db = this.#db
         if (!db) return
         db.exec('PRAGMA optimize')
-        // VACUUM is what actually reclaims disk space after large delete
-        // sweeps; PRAGMA optimize alone never shrinks the file.
-        db.exec('VACUUM')
+        // Returns the pages freed by cleanup sweeps to the OS. Cost scales
+        // with the size of the freelist, not the database (unlike VACUUM).
+        // A no-op if auto_vacuum was overridden away from INCREMENTAL.
+        db.exec('PRAGMA incremental_vacuum')
       }).catch(err => {
-        this.#logger.warn({ err }, 'SQLiteStorage: vacuum failed')
+        this.#logger.warn({ err }, 'SQLiteStorage: maintenance failed')
       })
     }, this.#vacuum.intervalMs)
   }
