@@ -867,6 +867,45 @@ describe('SQLiteStorage', () => {
       }
     })
 
+    it('should keep a root the user reconnected when its last namespace leaves concurrently', async () => {
+      const root = new SQLiteStorage()
+      const ns = root.createNamespace('child')
+      await root.connect()
+      await ns.connect()
+      try {
+        // Not awaited in turn: the namespace's "close the root if pending"
+        // must be decided after the user's connect() has cancelled the close.
+        await Promise.all([root.disconnect(), root.connect(), ns.disconnect()])
+        await root.enqueue('job-1', Buffer.from('x'), Date.now())
+        assert.deepStrictEqual(await root.dequeue('worker-1', 1), Buffer.from('x'))
+      } finally {
+        await root.disconnect()
+      }
+    })
+
+    it('should not let a namespace connect() cancel a disconnect() the user already issued', async () => {
+      const root = new SQLiteStorage()
+      const ns = root.createNamespace('child')
+      await root.connect()
+      try {
+        const calls = [root.disconnect(), root.connect(), root.disconnect()]
+        // Four microtasks in, the first disconnect() has closed the root and
+        // the reconnect and final disconnect() are still queued. A namespace
+        // connecting now sees the root closed; opening it must not jump ahead
+        // of the user's queued disconnect() and cancel it.
+        for (let i = 0; i < 4; i++) await Promise.resolve()
+        await Promise.all([...calls, ns.connect()])
+        await ns.disconnect()
+
+        // The user's last word was disconnect(): with the namespace gone the
+        // root must be closed, not left open with its timers running.
+        await assert.rejects(root.getWorkers(), /not connected/)
+      } finally {
+        await ns.disconnect()
+        await root.disconnect()
+      }
+    })
+
     it('should honour disconnect() called while a namespace connect() is in flight', async () => {
       for (const rootConnected of [true, false]) {
         const root = new SQLiteStorage()

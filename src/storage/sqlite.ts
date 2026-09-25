@@ -291,10 +291,14 @@ export class SQLiteStorage implements Storage {
       const parent = this.#parentStorage
       parent.#refCount++
       try {
-        // Only open the root if it isn't open. A root whose own disconnect()
-        // is deferred (#pendingClose) must stay on course to close once its
-        // children are gone, so a child connecting doesn't revive it.
-        if (!parent.#db) await parent.connect()
+        // Open the root only if it is closed when this runs on the root's
+        // lifecycle chain — not when we queue it: a user's disconnect() or
+        // connect() queued in between must keep its meaning. A root whose own
+        // disconnect() is deferred (#pendingClose) must stay on course to close
+        // once its children are gone, so a child connecting doesn't revive it.
+        await parent.#serializeLifecycle(async () => {
+          if (!parent.#db) await parent.#doConnect()
+        })
       } catch (err) {
         // Roll back the refCount increment so a future parent.disconnect()
         // doesn't see a phantom child blocking its teardown.
@@ -383,11 +387,13 @@ export class SQLiteStorage implements Storage {
   }
 
   // If the root was waiting on its children to close, complete its teardown.
+  // Decided when this runs on the root's lifecycle chain, not now: a
+  // root.connect() queued ahead of it cancels the pending close, and must win.
   async #closeParentIfPending (): Promise<void> {
     const parent = this.#parentStorage!
-    if (parent.#pendingClose && parent.#refCount === 0) {
-      await parent.disconnect()
-    }
+    await parent.#serializeLifecycle(async () => {
+      if (parent.#pendingClose && parent.#refCount === 0) await parent.#doDisconnect()
+    })
   }
 
   async disconnect (): Promise<void> {
